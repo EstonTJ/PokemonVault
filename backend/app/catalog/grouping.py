@@ -166,13 +166,19 @@ def _compatible(o: ObsLite, g: GroupDraft) -> bool:
 
 
 def _fingerprint(g: GroupDraft):
-    """Species + CP + HP + weight + height: effectively unique per individual within one recording."""
-    dex = g.consensus_value("dex")
-    cp = g.consensus_value("cp")
+    """Species + max HP + weight + height: effectively unique per individual within one recording.
+
+    CP is deliberately left out: one misread digit ("CP135" for 1353) must not split an individual in two.
+    If the CP readings disagree, consensus keeps the better-supported one and reports the conflict for review.
+    """
+    # A misread CP lowers confidence in the species reading too (the CP/HP no longer fit it), but the name itself
+    # was read; the exact weight + height + HP match is what makes this safe.
+    dex = g.consensus_value("dex", min_conf=0.25)
+    hp = g.consensus_value("hp")
     w, h = g.consensus_value("weight_kg"), g.consensus_value("height_m")
-    if None in (dex, cp, w, h):
+    if None in (dex, hp, w, h):
         return None
-    return (dex, cp, g.consensus_value("hp"), w, h)
+    return (dex, hp, w, h)
 
 
 def _signature(g: GroupDraft):
@@ -354,29 +360,93 @@ def _merge_by_fingerprint(groups: List[GroupDraft]) -> List[GroupDraft]:
     return out
 
 
-def group_observations(obs: List[ObsLite]) -> List[GroupDraft]:
+def _group_compatible(view: GroupDraft, slot: GroupDraft) -> bool:
+    if view.frames & slot.frames:
+        return False  # seen at the same moment = two different Pokémon
+    cp = view.consensus_value("cp")
+    if cp is None or slot.consensus_value("cp") != cp:
+        return False
+    return all(_compatible(o, slot) for o in view.obs)
+
+
+def _truncated_cp_match(view: GroupDraft, slot: GroupDraft, cp_feasible) -> bool:
+    """A view whose CP is impossible, and a grid entry whose CP is that number plus one more digit and fits the HP.
+
+    OCR sometimes loses a digit hidden behind the sprite ("CP135" for 1353); the grid shows the full number.
+    """
+    if cp_feasible is None or view.frames & slot.frames:
+        return False
+    sid, cp, hp = view.consensus_value("species_id", min_conf=0.25), view.consensus_value("cp"), view.consensus_value("hp")
+    full = slot.consensus_value("cp")
+    if None in (sid, cp, hp, full) or cp_feasible(sid, cp, hp):
+        return False
+    if not (str(full).startswith(str(cp)) and len(str(full)) == len(str(cp)) + 1):
+        return False
+    slot_dex, view_dex = slot.consensus_value("dex", min_conf=0.25), view.consensus_value("dex", min_conf=0.25)
+    if slot_dex is None or slot_dex != view_dex:
+        return False
+    return cp_feasible(slot.consensus_value("species_id", min_conf=0.25) or sid, full, hp)
+
+
+def _fold_views_into_grid(groups: List[GroupDraft], cp_feasible=None) -> List[GroupDraft]:
+    """Merge a detail/appraisal view into its storage-grid entry, whichever came first in the recording.
+
+    Only when the pairing is unambiguous both ways: the view matches exactly one grid entry, and that grid
+    entry matches no other view. Identical twins (same species and CP) on the grid stay separate.
+    """
+    for g in groups:
+        g.attributes, _ = consensus(g.obs)
+    grid = [g for g in groups if g.kind == "grid"]
+    views = [g for g in groups if g.kind != "grid"]
+    matches = {}
+    corrected: Set[int] = set()
+    for v in views:
+        exact = [s for s in grid if _group_compatible(v, s)]
+        if not exact:
+            fixed = [s for s in grid if _truncated_cp_match(v, s, cp_feasible)]
+            if len(fixed) == 1:
+                exact = fixed
+                corrected.add(id(v))
+        matches[id(v)] = exact
+    merged: Set[int] = set()
+    for v in views:
+        slots = matches[id(v)]
+        if len(slots) != 1:
+            continue
+        slot = slots[0]
+        rivals = [w for w in views if w is not v and slot in matches[id(w)]]
+        if rivals:
+            continue
+        if id(v) in corrected:
+            full = slot.consensus_value("cp")
+            for o in v.obs:
+                a = o.attrs.get("cp")
+                if a and a.get("value") != full:
+                    # Keep the misread for the record, but let the grid's full CP win the vote.
+                    o.attrs["cp"] = {**a, "confidence": 0.05, "method": f"{a.get('method', 'ocr')} (impossible; grid shows {full})"}
+                o.notes = [n for n in o.notes if not n.startswith("CP/HP are not achievable")]
+            for f in ("species_id", "dex", "form"):  # their low confidence came only from the impossible CP
+                for o in v.obs:
+                    if f in o.attrs and o.attrs[f].get("method", "").endswith(":infeasible"):
+                        o.attrs[f] = {**o.attrs[f], "confidence": min(0.9, o.attrs[f]["confidence"] * 2)}
+        slot.obs.extend(v.obs)
+        slot.attributes, _ = consensus(slot.obs)
+        merged.add(id(v))
+    return [g for g in groups if id(g) not in merged]
+
+
+def group_observations(obs: List[ObsLite], cp_feasible=None) -> List[GroupDraft]:
+    """`cp_feasible(species_id, cp, hp) -> bool` (optional) enables repairing a CP misread by one digit."""
     grid = _stitch_segments(_group_grid([o for o in obs if o.screen_type == "grid"]))
     details = _group_detail([o for o in obs if o.screen_type == "detail"])
 
-    # Fold detail tracks into a grid slot only when exactly one slot is compatible.
-    remaining_details: List[GroupDraft] = []
-    for d in details:
-        cp = d.consensus_value("cp")
-        sp = d.consensus_value("species_id")
-        cands = [g for g in grid if cp is not None and g.consensus_value("cp") == cp and
-                 (sp is None or g.consensus_value("species_id") in (None, sp))]
-        if len(cands) == 1:
-            cands[0].obs.extend(d.obs)
-        else:
-            if len(cands) > 1:
-                d.possible_duplicates.update(g.track_key for g in cands)
-                d.reasons.append("Detail view could match several grid items.")
-            remaining_details.append(d)
-
-    all_groups = grid + remaining_details
+    # Detail and appraisal views are folded into grid slots later, by _fold_views_into_grid, which checks the
+    # pairing is unambiguous in BOTH directions and works whichever came first in the recording.
+    all_groups = grid + details
     leftovers = _attach_appraisals([o for o in obs if o.screen_type == "appraisal"], all_groups)
     all_groups += leftovers
     all_groups = _merge_by_fingerprint(all_groups)
+    all_groups = _fold_views_into_grid(all_groups, cp_feasible)
 
     for g in all_groups:
         g.attributes, rs = consensus(g.obs)

@@ -191,3 +191,33 @@ def test_no_auto_link_when_setting_off(client, tmp_path):
     s2 = _scan(client, second)
     assert s2["summary"]["auto_linked"] == 0
     assert not any(g["link_method"] for g in s2["groups"])
+
+
+def test_link_matches_button_links_only_clear_resightings(client, tmp_path):
+    from tests.synthetic import DEFAULT_GRID
+
+    first = tmp_path / "one.mp4"
+    write_video(first)  # grid + Bulbasaur detail (HP) + appraisal
+    s1 = _scan(client, first)
+    client.post(f"/api/scans/{s1['id']}/confirm-ready", headers=H)
+    n_vault = len(client.get("/api/pokemon").json())
+
+    second = tmp_path / "two.mp4"
+    write_video(second, mons=DEFAULT_GRID[:12])  # same Pokémon again, including Bulbasaur's detail + appraisal
+    s2 = _scan(client, second)
+    linkable = s2["linkable"]
+    clear = [g for g in s2["groups"] if g["clear_match"]]
+    assert linkable == len(clear) >= 1
+    assert all(g["candidates"] and len(g["candidates"]) == 1 for g in clear)
+    # Grid-only re-sightings (species + CP only) are not "clear".
+    assert any(g["candidates"] and not g["clear_match"] for g in s2["groups"])
+
+    r = client.post(f"/api/scans/{s2['id']}/link-matches", headers=H).json()
+    assert r["linked"] == linkable
+    after = client.get(f"/api/scans/{s2['id']}").json()
+    assert after["linkable"] == 0
+    linked = [g for g in after["groups"] if g["link_method"] == "link"]
+    assert {g["id"] for g in linked} == {g["id"] for g in clear}
+    assert len(client.get("/api/pokemon").json()) == n_vault  # nothing duplicated
+    p = client.get(f"/api/pokemon/{linked[0]['pokemon_id']}").json()
+    assert p["user_confirmed"] is True and any(e["kind"] == "link" for e in p["evidence"])

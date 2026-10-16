@@ -5,7 +5,7 @@ import { DemoTag, Empty, ErrorBox, PageHeader, PokemonRow, Spinner, Stat, Status
 
 type Dash = {
   total: number; unique_species: number; shiny: number; shadow: number; lucky: number; special: Pokemon[];
-  special_count: number; unresolved: number; needs_review: number; ready: number; possible_duplicates: number;
+  special_count: number; unresolved: number; needs_review: number; ready: number; possible_duplicates: number; seen_before: number;
   evolve: { pokemon: Pokemon; reasons: string[] }[]; evolve_count: number;
   power_up: { pokemon: Pokemon; reasons: string[] }[]; power_up_count: number; demo_count: number; scans: Scan[];
   unknown_shiny: number; auto_unchecked: number;
@@ -41,7 +41,8 @@ export default function Dashboard() {
         <Stat label="Shadow" value={data.shadow} to="/collection?shadow=yes" />
         <Stat label="Rare & special forms" value={data.special_count} to="/collection?special=yes" />
         <Stat label="To review" value={data.unresolved} hint={`${data.needs_review} need attention · ${data.ready} ready`} to="/review" tone={data.unresolved ? "warn" : "default"} />
-        <Stat label="Possible duplicates" value={data.possible_duplicates} to="/review" tone={data.possible_duplicates ? "warn" : "default"} />
+        <Stat label="Seen before" value={data.seen_before} hint={data.seen_before ? "already in your vault: link them in Review" : undefined} to="/review" />
+        <Stat label="Possible duplicates" value={data.possible_duplicates} hint={data.possible_duplicates ? "may be seen twice in one recording" : undefined} to="/review" tone={data.possible_duplicates ? "warn" : "default"} />
         <Stat label="Lucky" value={data.lucky} to="/collection?lucky=yes" />
       </div>
 

@@ -55,3 +55,9 @@ def test_name_similarity_and_filter():
     assert not looks_like_name("CP 1500")
     assert not looks_like_name("123 / 145")
     assert not looks_like_name("")
+
+
+def test_cp_tolerates_leading_punctuation():
+    assert parse_cp(". CP601").value == 601
+    assert parse_cp("·CP 1460").value == 1460
+    assert parse_cp(".. 601") is None

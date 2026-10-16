@@ -150,7 +150,7 @@ def confirm_group(db: Session, g: ObservationGroup, link_to: Optional[str] = Non
     p.last_seen_at = utcnow()
     db.flush()
     db.add(PokemonEvidence(pokemon_id=p.id, group_id=g.id, scan_id=g.scan_id, frame_id=g.best_frame_id,
-                           kind=via if via in ("auto-link",) else "observation"))
+                           kind=via if via in ("auto-link", "link") else "observation"))
     g.pokemon_id = p.id
     g.status = "confirmed"
     g.link_method = via
@@ -199,8 +199,8 @@ def _positive_evidence(attrs: Dict[str, dict], p: Pokemon) -> List[str]:
     return found
 
 
-def auto_link_resightings(db: Session, scan_id: int, attempt_id: Optional[str] = None) -> List[str]:
-    """Link re-scanned Pokémon to existing ones, but only when the match is unambiguous AND corroborated.
+def linkable_resightings(db: Session, scan_id: int, attempt_id: Optional[str] = None) -> List[tuple]:
+    """(group, pokemon_id) pairs that may be linked: unambiguous AND corroborated.
 
     All of these must hold (anything else stays in Review):
       * the group's only open question is the identity match (no other review reasons);
@@ -221,7 +221,7 @@ def auto_link_resightings(db: Session, scan_id: int, attempt_id: Optional[str] =
     already = {pid for (pid,) in db.execute(_scope(select(ObservationGroup.pokemon_id).where(
         ObservationGroup.scan_id == scan_id, ObservationGroup.pokemon_id.isnot(None)), attempt_id))}
 
-    linked: List[str] = []
+    out: List[tuple] = []
     for g in groups:
         cands = g.candidate_pokemon_ids or []
         if len(cands) != 1 or g.review_reasons:
@@ -251,7 +251,20 @@ def auto_link_resightings(db: Session, scan_id: int, attempt_id: Optional[str] =
             continue
         if not _positive_evidence(attrs, p):
             continue  # species + CP alone is never enough
-        confirm_group(db, g, link_to=pid, via="auto-link")
+        out.append((g, pid))
         already.add(pid)
+    return out
+
+
+def auto_link_resightings(db: Session, scan_id: int, attempt_id: Optional[str] = None,
+                          via: str = "auto-link") -> List[str]:
+    """Link every unambiguous, corroborated re-sighting (see linkable_resightings).
+
+    via="auto-link" when the scanner does it (auto-confirm setting); "link" when the owner clicks
+    "Link all matches", which counts as the owner's decision.
+    """
+    linked = []
+    for g, pid in linkable_resightings(db, scan_id, attempt_id):
+        confirm_group(db, g, link_to=pid, via=via)
         linked.append(pid)
     return linked

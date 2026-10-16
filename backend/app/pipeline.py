@@ -161,7 +161,15 @@ def process_scan(ctx: JobContext, scan_id: int) -> None:
             db.commit()
 
     ctx.update(0.9, "grouping observations")
-    drafts = group_observations(lite)
+    from .recognition.feasibility import is_feasible
+
+    def cp_feasible(species_id, cp, hp):
+        sp = gd.get(species_id)
+        if sp is None:
+            return True  # unknown species: never "correct" anything
+        return any(is_feasible(f, cp, hp) for f in gd.by_base_name.get(sp.base_name.upper(), [sp]))
+
+    drafts = group_observations(lite, cp_feasible)
 
     # Stage the groups (invisible until published).
     with dbmod.SessionLocal() as db:

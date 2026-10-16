@@ -53,7 +53,7 @@ def test_failed_reprocess_keeps_previous_results_and_decisions(client, tmp_path,
     # Reprocess, and crash after the new attempt has written frames and observations.
     import app.pipeline as pipeline
 
-    def boom(_obs):
+    def boom(*_args, **_kwargs):
         raise RuntimeError("simulated crash mid-reprocess")
 
     monkeypatch.setattr(pipeline, "group_observations", boom)
@@ -104,12 +104,12 @@ def test_decision_made_during_processing_is_not_lost(client, tmp_path, monkeypat
 
     real = pipeline.group_observations
 
-    def owner_confirms_meanwhile(obs):
+    def owner_confirms_meanwhile(obs, *args, **kwargs):
         # While the attempt is processing, the owner confirms an item on the still-published results.
         r = client.post(f"/api/groups/{target['id']}/confirm",
                         json={"identity": "new"} if target["candidates"] else {}, headers=H)
         assert r.status_code == 200
-        return real(obs)
+        return real(obs, *args, **kwargs)
 
     monkeypatch.setattr(pipeline, "group_observations", owner_confirms_meanwhile)
     assert _upload(client, video, reprocess="true").status_code == 201

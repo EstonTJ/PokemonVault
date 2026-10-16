@@ -173,7 +173,9 @@ def get_scan(scan_id: int, db: Session = Depends(get_db)):
     groups = db.scalars(select(ObservationGroup).where(ObservationGroup.scan_id == scan_id, ObservationGroup.published.is_(True))
                         .order_by(ObservationGroup.first_ts_ms)).all()
     out = scan_json(s, _latest_job(db, scan_id))
-    out["groups"] = [group_json(g) for g in groups]
+    linkable = {g.id for g, _ in importer.linkable_resightings(db, scan_id)}
+    out["groups"] = [{**group_json(g), "clear_match": g.id in linkable} for g in groups]
+    out["linkable"] = len(linkable)
     return out
 
 
@@ -304,6 +306,16 @@ def reject(group_id: int, db: Session = Depends(get_db)):
     db.commit()
     _refresh_scan_status(db, g.scan_id)
     return group_json(g)
+
+
+@router.post("/scans/{scan_id}/link-matches")
+def link_matches(scan_id: int, db: Session = Depends(get_db)):
+    """Owner-approved: link every item that clearly is a Pokémon already in the vault."""
+    db.get(Scan, scan_id) or _404()
+    linked = importer.auto_link_resightings(db, scan_id, via="link")
+    db.commit()
+    _refresh_scan_status(db, scan_id)
+    return {"linked": len(linked)}
 
 
 @router.post("/scans/{scan_id}/confirm-ready")

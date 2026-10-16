@@ -1,3 +1,4 @@
+import pytest
 from app.catalog.grouping import ObsLite, consensus, group_observations
 
 _n = [0]
@@ -132,3 +133,83 @@ def test_weight_height_fingerprint_merges_repeat_views():
     assert len(group_observations([view(244, "appraisal", 4.07), view(1047, "detail", 4.07)])) == 1
     # Same species/CP/HP but different weight: two individuals.
     assert len(group_observations([view(244, "appraisal", 4.07), view(1047, "detail", 5.12)])) == 2
+
+
+def _view(frame, screen, cp, species, w, h, hp):
+    o = obs(frame, None, None, cp, species, screen=screen, hp=hp)
+    o.attrs["dex"] = {"value": 1, "confidence": 0.95}
+    o.attrs["weight_kg"] = {"value": w, "confidence": 0.99}
+    o.attrs["height_m"] = {"value": h, "confidence": 0.99}
+    return o
+
+
+def test_grid_seen_last_still_merges_with_earlier_views():
+    """Appraisal pass, then detail pass, then the storage grid at the end: one Pokémon, not two."""
+    o = [_view(71, "appraisal", 2024, "cinderace", 50.51, 1.65, 134),
+         _view(700, "detail", 2024, "cinderace", 50.51, 1.65, 134),
+         obs(990, 1, 300, 2024, "cinderace", segment=9)]
+    groups = group_observations(o)
+    assert len(groups) == 1
+    assert {x.screen_type for x in groups[0].obs} == {"appraisal", "detail", "grid"}
+    assert not groups[0].possible_duplicates
+
+
+def test_grid_fold_refuses_ambiguous_pairings():
+    # Two identical Bidoof on the grid, one detail view: can't know which -> stays separate and flagged.
+    o = [_view(10, "detail", 252, "bidoof", 4.0, 0.5, 60),
+         obs(990, 1, 300, 252, "bidoof", segment=9), obs(990, 2, 300, 252, "bidoof", segment=9)]
+    groups = group_observations(o)
+    assert len(groups) == 3
+    # One grid slot but two different detail views (different weights) -> also refused.
+    o = [_view(10, "detail", 500, "pidgey", 1.0, 0.3, 60), _view(20, "detail", 500, "pidgey", 2.0, 0.4, 61),
+         obs(990, 0, 300, 500, "pidgey", segment=9)]
+    assert len(group_observations(o)) == 3
+
+
+def test_misread_cp_does_not_split_an_individual():
+    """Same species, HP, weight and height; one frame read 'CP135' instead of 1353 -> one Pokémon, flagged."""
+    misread = _view(122, "appraisal", 135, "exeggutor_alolan", 628.26, 12.57, 121)
+    for k in ("species_id", "dex"):  # an impossible CP halves the species confidence, as the reader does
+        misread.attrs[k]["confidence"] = 0.45
+    o = [misread,
+         _view(140, "appraisal", 1353, "exeggutor_alolan", 628.26, 12.57, 121),
+         _view(700, "detail", 1353, "exeggutor_alolan", 628.26, 12.57, 121)]
+    groups = group_observations(o)
+    assert len(groups) == 1
+    assert groups[0].consensus_value("cp") == 1353
+    assert any("Conflicting cp" in r for r in groups[0].reasons)
+
+
+def test_impossible_cp_is_repaired_from_unique_grid_entry():
+    feasible = lambda sid, cp, hp: cp != 135  # stub: CP 135 is impossible for this HP, 1353 is fine
+    misread = _view(122, "appraisal", 135, "exeggutor", 628.26, 12.57, 121)
+    misread.attrs["species_id"]["method"] = "name:infeasible"
+    misread.attrs["dex"]["value"] = 103
+    grid = obs(990, 1, 300, 1353, "exeggutor", segment=9)
+    grid.attrs["dex"] = {"value": 103, "confidence": 0.95}
+    groups = group_observations([misread, grid], cp_feasible=feasible)
+    assert len(groups) == 1 and groups[0].consensus_value("cp") == 1353
+    assert not any("not achievable" in r for r in groups[0].reasons)
+
+
+@pytest.mark.parametrize("grid_cp, feasible", [
+    (1353, lambda sid, cp, hp: True),          # misread CP is actually possible -> no repair
+    (1363, lambda sid, cp, hp: cp != 135),     # doesn't start with the misread digits -> no repair
+    (13530, lambda sid, cp, hp: cp != 135),    # two extra digits -> no repair
+])
+def test_cp_repair_stays_narrow(grid_cp, feasible):
+    misread = _view(122, "appraisal", 135, "exeggutor", 628.26, 12.57, 121)
+    misread.attrs["dex"]["value"] = 103
+    grid = obs(990, 1, 300, grid_cp, "exeggutor", segment=9)
+    grid.attrs["dex"] = {"value": 103, "confidence": 0.95}
+    assert len(group_observations([misread, grid], cp_feasible=feasible)) == 2
+
+
+def test_cp_repair_refused_when_two_grid_entries_fit():
+    feasible = lambda sid, cp, hp: cp != 135
+    misread = _view(122, "appraisal", 135, "exeggutor", 628.26, 12.57, 121)
+    misread.attrs["dex"]["value"] = 103
+    grids = [obs(990, c, 300, cp, "exeggutor", segment=9) for c, cp in ((0, 1353), (1, 1357))]
+    for g in grids:
+        g.attrs["dex"] = {"value": 103, "confidence": 0.95}
+    assert len(group_observations([misread] + grids, cp_feasible=feasible)) == 3

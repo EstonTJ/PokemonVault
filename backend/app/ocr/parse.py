@@ -43,8 +43,9 @@ _CP_PREFIX_ONLY = re.compile(r"^\s*[Cc][Pp]\s*$")
 
 
 def parse_cp(text: str, ocr_conf: float = 1.0) -> Optional[Parsed]:
-    """Parse 'CP 1523' / 'CP1523' / 'CP 15Z3' -> 1523."""
-    m = _CP_RE.match(normalize(text))
+    """Parse 'CP 1523' / 'CP1523' / 'CP 15Z3' / '. CP601' -> number."""
+    # OCR sometimes attaches stray punctuation from the sprite or background in front of "CP".
+    m = _CP_RE.match(re.sub(r"^[^A-Za-z0-9]+", "", normalize(text)))
     if not m:
         return None
     digits, subs = _digits(m.group(1))

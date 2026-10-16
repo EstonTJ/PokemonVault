@@ -276,7 +276,10 @@ def dashboard(include_demo: bool = True, db: Session = Depends(get_db)):
     js = [pokemon_json(p) for p in pokes]
     pending = db.scalars(select(ObservationGroup).where(ObservationGroup.status.in_(("needs_review", "ready")),
                                                         ObservationGroup.published.is_(True))).all()
-    dup_groups = [g for g in pending if g.candidate_pokemon_ids or any("duplicate" in r.lower() for r in (g.review_reasons or []))]
+    # "Seen before" = matches a Pokémon already in the vault (normal when rescanning).
+    # "Possible duplicates" = might be the same Pokémon seen twice within one recording (needs a look).
+    seen_before = [g for g in pending if g.candidate_pokemon_ids]
+    dup_groups = [g for g in pending if any("duplicate" in r.lower() for r in (g.review_reasons or []))]
     recs = _all_recs(db, include_demo)
     evolve = [{"pokemon": pokemon_json(p), "reasons": a["reasons"]} for p, r in recs for a in r["actions"] if a["action"] == "Evolve"]
     power = [{"pokemon": pokemon_json(p), "reasons": a["reasons"]} for p, r in recs for a in r["actions"] if a["action"] == "Power Up"]
@@ -293,6 +296,7 @@ def dashboard(include_demo: bool = True, db: Session = Depends(get_db)):
         "needs_review": sum(1 for g in pending if g.status == "needs_review"),
         "ready": sum(1 for g in pending if g.status == "ready"),
         "possible_duplicates": len(dup_groups),
+        "seen_before": len(seen_before),
         "evolve": evolve[:6], "evolve_count": len(evolve),
         "power_up": power[:6], "power_up_count": len(power),
         "demo_count": sum(1 for p in js if p["is_demo"]),

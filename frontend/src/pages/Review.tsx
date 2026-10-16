@@ -27,6 +27,12 @@ export default function Review({ onChange }: { onChange: (n: number) => void }) 
     reload();
   }
 
+  async function linkMatches() {
+    if (!scanId) return;
+    await api(`/api/scans/${scanId}/link-matches`, { method: "POST" });
+    reload();
+  }
+
   const scan = scanId ? (data as Scan | null) : null;
 
   return (
@@ -38,6 +44,18 @@ export default function Review({ onChange }: { onChange: (n: number) => void }) 
           : "Items the scanner was unsure about, or that need you to say whether they're the same Pokémon."}
         action={scanId && ready > 0 ? <button className="btn-primary" onClick={confirmReady}>Confirm {ready} ready</button> : undefined}
       />
+      {scan && (scan.linkable ?? 0) > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl bg-sky-500/10 p-3 text-sm ring-1 ring-sky-500/30">
+          <div className="min-w-0 flex-1">
+            <b>{scan.linkable} {scan.linkable === 1 ? "Pokémon is" : "Pokémon are"} already in your vault.</b>{" "}
+            <span className="text-slate-600 dark:text-slate-300">
+              Each matches exactly one vault Pokémon on species, CP and HP plus exact weight and height or verified IVs.
+              Linking records that you saw them again; nothing is duplicated.
+            </span>
+          </div>
+          <button className="btn-primary" onClick={linkMatches}>Link {scan.linkable} matches</button>
+        </div>
+      )}
       {scan?.summary?.message && <div className="mb-4 rounded-xl bg-amber-500/10 p-3 text-sm text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">{scan.summary.message}</div>}
       {scanId && (
         <div className="mb-4 flex gap-2">
@@ -123,7 +141,8 @@ function GroupCard({ g, onDone }: { g: Group; onDone: () => void }) {
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-2">
             <div className="truncate text-base font-semibold">{title}</div>
-            {g.link_method === "auto-link" ? <span className="chip bg-sky-500/15 text-sky-600 dark:text-sky-300" title="Matched exactly one Pokémon already in your vault">auto-linked</span>
+            {g.clear_match && g.status === "needs_review" ? <span className="chip bg-sky-500/15 text-sky-600 dark:text-sky-300" title="Clearly the same as one Pokémon already in your vault">clear match</span>
+              : g.link_method === "auto-link" || g.link_method === "link" ? <span className="chip bg-sky-500/15 text-sky-600 dark:text-sky-300" title="Matched exactly one Pokémon already in your vault">{g.link_method === "link" ? "linked" : "auto-linked"}</span>
               : g.link_method === "auto" ? <span className="chip bg-sky-500/15 text-sky-600 dark:text-sky-300">auto-added</span>
               : <StatusPill status={g.status} />}
           </div>

@@ -15,7 +15,7 @@ export type Job = {
 export type Scan = {
   id: number; created_at: string; original_filename: string; size_bytes: number; kind: string; status: string;
   keep_video: boolean; video_stored: boolean; duration_s: number | null; frames_retained: number; is_demo: boolean;
-  summary: Record<string, any>; error: string | null; job: Job | null; groups?: Group[];
+  summary: Record<string, any>; error: string | null; job: Job | null; groups?: Group[]; linkable?: number;
 };
 
 export type Candidate = { pokemon_id: string; score: number; reasons: string[]; pokemon?: Pokemon };
@@ -23,7 +23,7 @@ export type Candidate = { pokemon_id: string; score: number; reasons: string[]; 
 export type Group = {
   id: number; scan_id: number; track_key: string; status: string; attributes: Record<string, Attr>;
   species_name: string | null; review_reasons: string[]; candidates: Candidate[]; pokemon_id: string | null;
-  observation_count: number; first_ts_ms: number; best_frame_id: number | null; best_bbox: number[] | null; link_method: string | null;
+  observation_count: number; first_ts_ms: number; best_frame_id: number | null; best_bbox: number[] | null; link_method: string | null; clear_match?: boolean;
 };
 
 export type Pokemon = {
