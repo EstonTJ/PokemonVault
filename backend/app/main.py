@@ -18,8 +18,37 @@ from .migrate import upgrade
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+log = logging.getLogger("pokevault.startup")
+
+
+class StartupError(RuntimeError):
+    pass
+
+
+def check_database() -> None:
+    """Fail fast, with a readable reason, if the database can't be reached (instead of hanging)."""
+    from sqlalchemy import create_engine, text
+
+    from .db import connect_args_for
+
+    eng = create_engine(settings.database_url, connect_args=connect_args_for(settings.database_url))
+    try:
+        with eng.connect() as c:
+            c.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001 - report any driver error the same way
+        first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        raise StartupError(
+            f"Can't connect to the {settings.database_kind} database at {settings.database_url_redacted}: {first_line}. "
+            "Check that the database exists and is running, and that DATABASE_URL (or POKEVAULT_DATABASE_URL) "
+            "is set for this deployment.") from None
+    finally:
+        eng.dispose()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log.info("Starting PokéVault: database %s (%s), data folder %s",
+             settings.database_kind, settings.database_url_redacted, settings.data_dir)
     settings.ensure_dirs()
     if not settings.storage_persistent:
         logging.getLogger("pokevault").error(
@@ -27,12 +56,25 @@ async def lifespan(app: FastAPI):
             "using a SQLite file, which is erased on every redeploy. Attach PostgreSQL and set DATABASE_URL "
             "(or POKEVAULT_DATABASE_URL). Uploads are refused until then%s.",
             "" if not settings.allow_ephemeral_storage else " (overridden by POKEVAULT_ALLOW_EPHEMERAL_STORAGE)")
-    upgrade(settings.database_url)
+    try:
+        log.info("Connecting to the database (timeout %ss)...", settings.db_connect_timeout_s)
+        check_database()
+        log.info("Database reachable. Applying migrations...")
+        upgrade(settings.database_url)
+        log.info("Database schema up to date.")
+    except StartupError as exc:
+        log.error("STARTUP FAILED: %s", exc)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.error("STARTUP FAILED while migrating the database: %s: %s", type(exc).__name__,
+                  str(exc).strip().splitlines()[0] if str(exc).strip() else "")
+        raise
     init_auth()
     worker = None
     if settings.run_worker_in_process:
         worker = WorkerThread()
         worker.start()
+    log.info("PokéVault is ready.")
     yield
     if worker:
         worker.stop()

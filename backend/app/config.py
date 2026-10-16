@@ -58,6 +58,9 @@ class Settings:
     # Game data older than this many days makes rankings provisional
     gamedata_stale_days: int = field(default_factory=lambda: _env_int("POKEVAULT_GAMEDATA_STALE_DAYS", 45))
 
+    db_connect_timeout_s: int = field(default_factory=lambda: _env_int("POKEVAULT_DB_CONNECT_TIMEOUT_S", 10))
+    db_lock_timeout_s: int = field(default_factory=lambda: _env_int("POKEVAULT_DB_LOCK_TIMEOUT_S", 60))
+
     # Storage safety. Replit sets REPLIT_DEPLOYMENT=1 in deployments, whose disk is reset on every redeploy,
     # so a SQLite file there silently loses everything. Other ephemeral hosts can opt in with
     # POKEVAULT_REQUIRE_PERSISTENT_DB=1. POKEVAULT_ALLOW_EPHEMERAL_STORAGE=1 overrides (for throwaway demos).
@@ -79,6 +82,15 @@ class Settings:
         for prefix in ("postgres://", "postgresql://"):
             if self.database_url.startswith(prefix):
                 self.database_url = "postgresql+psycopg://" + self.database_url[len(prefix):]
+
+    @property
+    def database_url_redacted(self) -> str:
+        from sqlalchemy.engine import make_url
+
+        try:
+            return make_url(self.database_url).render_as_string(hide_password=True)
+        except Exception:  # noqa: BLE001 - never leak a malformed URL that might contain a password
+            return self.database_kind + "://(unparseable URL)"
 
     @property
     def database_kind(self) -> str:

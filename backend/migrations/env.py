@@ -20,7 +20,10 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = engine_from_config({"sqlalchemy.url": _url()}, prefix="sqlalchemy.", poolclass=pool.NullPool)
+    from app.db import connect_args_for
+
+    connectable = engine_from_config({"sqlalchemy.url": _url()}, prefix="sqlalchemy.", poolclass=pool.NullPool,
+                                     connect_args=connect_args_for(_url(), for_migrations=True))
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
         with context.begin_transaction():

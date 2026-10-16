@@ -13,9 +13,23 @@ class Base(DeclarativeBase):
     pass
 
 
+def connect_args_for(url: str, *, for_migrations: bool = False) -> dict:
+    if url.startswith("sqlite"):
+        return {"check_same_thread": False, "timeout": 30}
+    if url.startswith("postgresql"):
+        # Without a timeout, an unreachable database makes startup hang silently forever.
+        args = {"connect_timeout": settings.db_connect_timeout_s}
+        if for_migrations:
+            # Fail instead of waiting indefinitely if another instance holds a table lock during a rollout.
+            args["options"] = f"-c lock_timeout={settings.db_lock_timeout_s * 1000}"
+        return args
+    return {}
+
+
 def make_engine(url: str):
-    connect_args = {"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {}
-    eng = create_engine(url, connect_args=connect_args, future=True)
+    is_pg = url.startswith("postgresql")
+    # Hosted PostgreSQL (Replit/Neon) drops idle connections; pre-ping replaces dead ones transparently.
+    eng = create_engine(url, connect_args=connect_args_for(url), future=True, pool_pre_ping=is_pg)
     if url.startswith("sqlite"):
         @event.listens_for(eng, "connect")
         def _pragmas(dbapi_conn, _):  # pragma: no cover - trivial
