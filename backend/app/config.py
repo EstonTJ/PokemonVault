@@ -58,17 +58,55 @@ class Settings:
     # Game data older than this many days makes rankings provisional
     gamedata_stale_days: int = field(default_factory=lambda: _env_int("POKEVAULT_GAMEDATA_STALE_DAYS", 45))
 
+    # Storage safety. Replit sets REPLIT_DEPLOYMENT=1 in deployments, whose disk is reset on every redeploy,
+    # so a SQLite file there silently loses everything. Other ephemeral hosts can opt in with
+    # POKEVAULT_REQUIRE_PERSISTENT_DB=1. POKEVAULT_ALLOW_EPHEMERAL_STORAGE=1 overrides (for throwaway demos).
+    on_replit_deployment: bool = field(default_factory=lambda: os.environ.get("REPLIT_DEPLOYMENT") == "1")
+    require_persistent_db: bool = field(default_factory=lambda: _env_bool("POKEVAULT_REQUIRE_PERSISTENT_DB", False))
+    allow_ephemeral_storage: bool = field(default_factory=lambda: _env_bool("POKEVAULT_ALLOW_EPHEMERAL_STORAGE", False))
+
     # Optional user-supplied sprite references (none are bundled)
     sprite_dir: str = field(default_factory=lambda: os.environ.get("POKEVAULT_SPRITE_DIR", ""))
 
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir)
         if not self.database_url:
-            self.database_url = os.environ.get("POKEVAULT_DATABASE_URL", f"sqlite:///{self.data_dir / 'pokevault.db'}")
+            # POKEVAULT_DATABASE_URL wins; otherwise use DATABASE_URL, which Replit (and most hosts) set
+            # automatically when a PostgreSQL database is attached; otherwise a local SQLite file.
+            self.database_url = (os.environ.get("POKEVAULT_DATABASE_URL") or os.environ.get("DATABASE_URL")
+                                 or f"sqlite:///{self.data_dir / 'pokevault.db'}")
         # Replit/Heroku-style URLs -> SQLAlchemy psycopg3 driver.
         for prefix in ("postgres://", "postgresql://"):
             if self.database_url.startswith(prefix):
                 self.database_url = "postgresql+psycopg://" + self.database_url[len(prefix):]
+
+    @property
+    def database_kind(self) -> str:
+        return "sqlite" if self.database_url.startswith("sqlite") else self.database_url.split(":", 1)[0].split("+")[0]
+
+    @property
+    def storage_persistent(self) -> bool:
+        """False when the database would be erased by the host (e.g. SQLite inside a Replit deployment)."""
+        ephemeral_host = self.on_replit_deployment or self.require_persistent_db
+        return not (ephemeral_host and self.database_kind == "sqlite")
+
+    @property
+    def storage_writable(self) -> bool:
+        """Whether new recordings may be accepted. Refuse when they would be silently lost."""
+        return self.storage_persistent or self.allow_ephemeral_storage
+
+    def storage_status(self) -> dict:
+        ephemeral_host = self.on_replit_deployment or self.require_persistent_db
+        return {
+            "persistent": self.storage_persistent,
+            "accepting_uploads": self.storage_writable,
+            "database": self.database_kind,
+            "ephemeral_host": ephemeral_host,
+            # Without a fixed secret, a redeploy signs everyone out (harmless, but surprising).
+            "secret_key_configured": bool(self.secret_key) or not ephemeral_host,
+            # Evidence images and partial uploads live on disk; on an ephemeral host they don't survive redeploys.
+            "files_survive_redeploy": not ephemeral_host,
+        }
 
     @property
     def private_dir(self) -> Path:

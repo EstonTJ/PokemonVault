@@ -20,15 +20,39 @@ os.environ["POKEVAULT_SECURE_COOKIES"] = "0"
 os.environ["POKEVAULT_DATABASE_URL"] = f"sqlite:///{Path(_TMP) / 'session.db'}"
 
 
+@pytest.fixture(scope="session")
+def _postgres_url():
+    """With POKEVAULT_TEST_POSTGRES=1, run every DB test on a real throwaway PostgreSQL (pip install pgserver)."""
+    if os.environ.get("POKEVAULT_TEST_POSTGRES") != "1":
+        yield None
+        return
+    import pgserver
+
+    srv = pgserver.get_server(Path(_TMP) / "pg", cleanup_mode="stop")
+    yield srv.get_uri().replace("postgresql://", "postgresql+psycopg://", 1)
+    srv.cleanup()
+
+
 @pytest.fixture()
-def fresh_db(tmp_path):
+def fresh_db(tmp_path, _postgres_url):
     from app import db as dbmod
     from app.migrate import upgrade
 
-    url = f"sqlite:///{tmp_path / 'test.db'}"
+    if _postgres_url:
+        import sqlalchemy as sa
+
+        eng = sa.create_engine(_postgres_url)
+        with eng.begin() as c:  # a clean schema per test, built by the real migrations
+            c.execute(sa.text("DROP SCHEMA public CASCADE"))
+            c.execute(sa.text("CREATE SCHEMA public"))
+        eng.dispose()
+        url = _postgres_url
+    else:
+        url = f"sqlite:///{tmp_path / 'test.db'}"
     upgrade(url)
     dbmod.configure(url)
     yield dbmod
+    dbmod.engine.dispose()
 
 
 @pytest.fixture(autouse=True)

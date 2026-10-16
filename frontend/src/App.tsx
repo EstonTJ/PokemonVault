@@ -31,7 +31,12 @@ function Icon({ d }: { d: string }) {
 export default function App() {
   const [auth, setAuth] = useState<boolean | null>(null);
   const [pending, setPending] = useState(0);
+  const [storageOk, setStorageOk] = useState(true);
   const nav = useNavigate();
+
+  useEffect(() => {
+    api<{ storage_persistent?: boolean }>("/api/health").then((h) => setStorageOk(h.storage_persistent !== false)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     setUnauthorizedHandler(() => setAuth(false));
@@ -47,9 +52,12 @@ export default function App() {
   }, [auth]);
 
   if (auth === null) return <div className="flex h-screen items-center justify-center"><Spinner /></div>;
-  if (!auth) return <Login onDone={() => { setAuth(true); nav("/"); }} />;
+  const banner = !storageOk && <StorageBanner />;
+  if (!auth) return <>{banner}<Login onDone={() => { setAuth(true); nav("/"); }} /></>;
 
   return (
+    <>
+    {banner}
     <div className="mx-auto flex min-h-screen max-w-6xl">
       <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col gap-1 border-r border-slate-200/70 p-4 dark:border-white/5 md:flex">
         <Brand />
@@ -99,6 +107,16 @@ export default function App() {
           ))}
         </div>
       </nav>
+    </div>
+    </>
+  );
+}
+
+function StorageBanner() {
+  return (
+    <div role="alert" className="sticky top-0 z-40 bg-rose-600 px-4 py-2.5 text-center text-sm font-medium text-white">
+      Storage isn't persistent: this deployment's data is erased on every redeploy, so uploads are turned off.{" "}
+      Connect a PostgreSQL database (Settings → Storage).
     </div>
   );
 }

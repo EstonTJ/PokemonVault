@@ -58,6 +58,37 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
         </section>
       )}
 
+      {data?.storage && (
+        <section className={`card p-5 text-sm ${data.storage.persistent ? "" : "ring-2 ring-rose-500"}`}>
+          <h2 className="mb-2 font-semibold">Storage</h2>
+          <dl className="grid grid-cols-2 gap-y-1.5 text-slate-600 dark:text-slate-300">
+            <dt>Database</dt>
+            <dd className="text-right">{data.storage.database === "postgresql" ? "PostgreSQL" : data.storage.database === "sqlite" ? "Local file (SQLite)" : data.storage.database}</dd>
+            <dt>Survives redeploys</dt>
+            <dd className={`text-right font-semibold ${data.storage.persistent ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600"}`}>
+              {data.storage.persistent ? "Yes" : "No"}</dd>
+            <dt>Accepting uploads</dt><dd className="text-right">{data.storage.accepting_uploads ? "Yes" : "No"}</dd>
+            {data.storage.ephemeral_host && (<>
+              <dt>Stay signed in across redeploys</dt>
+              <dd className="text-right">{data.storage.secret_key_configured ? "Yes" : "No (set POKEVAULT_SECRET_KEY)"}</dd>
+            </>)}
+          </dl>
+          {!data.storage.persistent && (
+            <div className="mt-3 rounded-xl bg-rose-500/10 p-3 text-xs leading-relaxed text-rose-700 ring-1 ring-rose-500/30 dark:text-rose-300">
+              This deployment keeps its data in a file that is erased on every redeploy, so uploads are turned off.
+              In Replit, add a PostgreSQL database to this Repl (it creates a <code>DATABASE_URL</code> secret), make sure
+              the deployment has that secret, then redeploy.
+            </div>
+          )}
+          {data.storage.persistent && data.storage.ephemeral_host && !data.storage.files_survive_redeploy && (
+            <p className="mt-3 text-xs text-slate-500">
+              Your vault and scan history are safe in the database. Evidence screenshots are stored on the server's
+              disk and are cleared by a redeploy; the Pokémon and their recorded values are not affected.
+            </p>
+          )}
+        </section>
+      )}
+
       <section className="card p-5 text-sm">
         <h2 className="mb-1 font-semibold">Appearance</h2>
         <button className="btn-ghost mt-2" onClick={toggleTheme}>{dark ? "Switch to light mode" : "Switch to dark mode"}</button>

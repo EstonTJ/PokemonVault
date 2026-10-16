@@ -24,7 +24,7 @@ schema and the milestones, and **[NOTICE.md](NOTICE.md)** for attributions.
 | Real storage grid | Only briefly present in recording #1 (4 frames, about 15 Pokémon). Works, but needs a longer grid-scroll recording to judge properly. |
 | Shiny / favorite icons | Not detected. Always "unknown" unless you set them. |
 | Lucky / shadow | Text cues only (`LUCKY`, `PURIFY` button). Not yet seen in a real recording. |
-| PostgreSQL backend | Supported by configuration but not yet exercised by the test suite |
+| PostgreSQL backend | Full test suite passes on PostgreSQL 16 (`POKEVAULT_TEST_POSTGRES=1`, needs `pip install pgserver`) |
 
 ## Run locally
 
@@ -49,24 +49,34 @@ Tests (36: OCR parsing, grouping, dedup, identity, queue, appraisal, end-to-end,
 cd backend && ../.venv/bin/python -m pytest -q
 ```
 
+The same suite against a real throwaway PostgreSQL (run `pip install pgserver` once):
+
+```bash
+cd backend && POKEVAULT_TEST_POSTGRES=1 ../.venv/bin/python -m pytest -q
+```
+
 ## Deploying on Replit
 
+> **Attach a PostgreSQL database before you add any data.** A Replit deployment's disk is reset on every
+> redeploy, so the default SQLite file would be erased each time. PokéVault detects this: on a Replit deployment
+> without PostgreSQL it refuses uploads and shows a red warning on every page.
+
 1. Import the project into a Repl. `.replit` and `replit.nix` install Python 3.11, Node 20 and FFmpeg.
-2. Add Secrets:
+2. **Add a PostgreSQL database** to the Repl (Replit's Database tool). Replit creates a `DATABASE_URL` secret,
+   and PokéVault uses it automatically. `POKEVAULT_DATABASE_URL` overrides it if set.
+3. Add Secrets:
    * `POKEVAULT_PASSWORD`: your owner password (required).
-   * `POKEVAULT_SECRET_KEY`: a long random string, so sessions survive restarts.
-   * `POKEVAULT_DATABASE_URL`: **recommended.** Create a Replit PostgreSQL database and paste its URL here.
-     Replit deployment filesystems are reset on every redeploy, so a SQLite file inside the
-     deployment would lose your collection. SQLite is fine for local use or for a host with a persistent disk.
-3. Deploy as a **Reserved VM**, not Autoscale. Processing runs in a background worker inside the app process,
+   * `POKEVAULT_SECRET_KEY`: a long random string, so you stay signed in across redeploys.
+4. Deploy as a **Reserved VM**, not Autoscale. Processing runs in a background worker inside the app process,
    and Autoscale's scale-to-zero would interrupt it.
+5. Check it: `https://<your-app>/api/health` should say `"storage_persistent": true`, and
+   **Settings → Storage** should show *PostgreSQL* and *Survives redeploys: Yes*.
 
-Evidence frames live on the deployment's disk and disappear on redeploy. That
-fits the "minimize retained images" goal: the collection keeps every confirmed
-value with its confidence, and only the screenshots go.
+Evidence screenshots live on the deployment's disk and are cleared by a redeploy. Your Pokémon, their recorded
+values, scan history and review decisions are all kept in the database.
 
-**Alternative host:** any small VM with a persistent disk (e.g. a Fly.io machine with a
-volume, or a $5 VPS) can run `start.sh` directly with SQLite and no extra database.
+**Alternative host:** any small VM with a persistent disk (e.g. a Fly.io machine with a volume, or a $5 VPS)
+can run `start.sh` directly with SQLite and no extra database.
 
 ## Privacy & security summary
 

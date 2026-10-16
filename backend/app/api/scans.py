@@ -38,8 +38,13 @@ def _latest_job(db: Session, scan_id: int) -> Optional[Job]:
     return db.scalars(select(Job).where(Job.scan_id == scan_id).order_by(Job.id.desc()).limit(1)).first()
 
 
+STORAGE_NOT_PERSISTENT = ("Storage isn't persistent on this deployment: anything you add now would be erased on the next redeploy. Connect a PostgreSQL database first (see Settings → Storage).")
+
+
 def check_upload_allowed(db: Session, filename: str, kind: str, size: Optional[int]) -> str:
     """Checks shared by every upload path. Returns the validated file extension."""
+    if not settings.storage_writable:
+        raise HTTPException(503, STORAGE_NOT_PERSISTENT)
     if kind not in ("auto", "collection", "appraisal"):
         raise HTTPException(400, "kind must be auto, collection or appraisal.")
     ext = os.path.splitext(filename)[1].lower()

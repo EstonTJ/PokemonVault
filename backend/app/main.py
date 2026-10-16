@@ -21,6 +21,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.ensure_dirs()
+    if not settings.storage_persistent:
+        logging.getLogger("pokevault").error(
+            "STORAGE IS NOT PERSISTENT: this is a Replit deployment (or POKEVAULT_REQUIRE_PERSISTENT_DB is set) "
+            "using a SQLite file, which is erased on every redeploy. Attach PostgreSQL and set DATABASE_URL "
+            "(or POKEVAULT_DATABASE_URL). Uploads are refused until then%s.",
+            "" if not settings.allow_ephemeral_storage else " (overridden by POKEVAULT_ALLOW_EPHEMERAL_STORAGE)")
     upgrade(settings.database_url)
     init_auth()
     worker = None

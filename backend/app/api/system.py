@@ -28,7 +28,8 @@ router = APIRouter(prefix="/api", dependencies=[Owner])
 
 @public.get("/health")
 def health():
-    return {"ok": True}
+    # storage_persistent is public on purpose: it lets you check a deployment without signing in.
+    return {"ok": True, "storage_persistent": settings.storage_persistent}
 
 
 @public.post("/auth/login")
@@ -65,6 +66,7 @@ def get_settings(db: Session = Depends(get_db)):
         "auto_confirm_ready": bool(stored.get("auto_confirm_ready", False)),
         "upload_key": auth.upload_key_info(db),
         "ocr_engine": ocr_name,
+        "storage": settings.storage_status(),
         "gamedata": {"source": gd.source, "timestamp": gd.timestamp, "stale": gd.is_stale(), "species": len(gd.species)},
     }
 
