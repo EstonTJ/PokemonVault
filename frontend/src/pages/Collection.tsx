@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, Pokemon } from "../api";
 import { Empty, ErrorBox, PageHeader, PokemonRow, Spinner, useAsync } from "../ui";
@@ -9,12 +9,40 @@ export default function Collection() {
   const [params, setParams] = useSearchParams();
   const [q, setQ] = useState(params.get("q") ?? "");
   const [showFilters, setShowFilters] = useState(false);
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const toggle = (id: string) => setSelected((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const exitSelect = () => { setSelecting(false); setSelected(new Set()); setConfirming(false); };
+
+  async function removeSelected() {
+    setBusy(true);
+    try {
+      const r = await api<{ removed: number }>("/api/pokemon/bulk-delete", { method: "POST", body: { ids: [...selected] } });
+      setNotice(`Removed ${r.removed} from your vault. Their scan items are back in Review.`);
+      exitSelect();
+      reload();
+    } catch (e: any) {
+      setNotice(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
   const query = useMemo(() => {
     const p = new URLSearchParams(params);
     if (!p.get("sort")) p.set("sort", "recent");
     return p.toString();
   }, [params]);
   const { data, error, loading, reload } = useAsync(() => api<Pokemon[]>(`/api/pokemon?${query}`), [query]);
+  // Never act on Pokémon that are no longer shown: a new search/filter starts a fresh selection.
+  useEffect(() => { setSelected(new Set()); setConfirming(false); }, [query]);
 
   const set = (k: string, v: string | null) => {
     const p = new URLSearchParams(params);
@@ -28,6 +56,11 @@ export default function Collection() {
       <PageHeader title="Vault" subtitle={data ? `${data.length} Pokémon` : undefined}
         action={
           <div className="flex gap-2">
+            {data && data.length > 0 && (
+              <button className={`btn-ghost px-3 ${selecting ? "ring-2 ring-vault-500" : ""}`} onClick={() => (selecting ? exitSelect() : setSelecting(true))}>
+                {selecting ? "Done" : "Select"}
+              </button>
+            )}
             <a className="btn-ghost px-3" href="/api/export/collection.csv" download>CSV</a>
             <a className="btn-ghost px-3" href="/api/export/collection.json" download>JSON</a>
           </div>
@@ -81,9 +114,47 @@ export default function Collection() {
       {loading && !data && <div className="flex justify-center py-16"><Spinner /></div>}
       {error && <ErrorBox error={error} onRetry={reload} />}
       {data && data.length === 0 && <Empty>No Pokémon match. Confirmed scan results appear here.</Empty>}
-      <div className="grid gap-2 md:grid-cols-2">
-        {data?.map((p) => <PokemonRow key={p.id} p={p} />)}
+      {notice && <div className="mb-3 rounded-xl bg-slate-100 p-3 text-sm dark:bg-white/5">{notice}</div>}
+      <div className={`grid gap-2 md:grid-cols-2 ${selecting ? "pb-28" : ""}`}>
+        {data?.map((p) => selecting ? (
+          <label key={p.id} className={`relative block cursor-pointer rounded-2xl ${selected.has(p.id) ? "ring-2 ring-vault-500" : ""}`}>
+            <input type="checkbox" className="absolute left-3 top-1/2 z-10 h-5 w-5 -translate-y-1/2 accent-vault-500"
+              checked={selected.has(p.id)} onChange={() => toggle(p.id)} aria-label={`Select ${p.nickname || p.species_name}`} />
+            <div className="pointer-events-none pl-9"><PokemonRow p={p} /></div>
+          </label>
+        ) : <PokemonRow key={p.id} p={p} />)}
       </div>
+
+      {selecting && data && (
+        <div className="fixed inset-x-0 bottom-16 z-30 px-4 md:bottom-4 md:left-56">
+          <div className="card mx-auto max-w-3xl p-3">
+            {!confirming ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-semibold">{selected.size} selected</span>
+                <button className="btn-ghost px-3 py-1.5 text-xs" onClick={() => setSelected(new Set(data.map((p) => p.id)))}>
+                  Select all shown ({data.length})
+                </button>
+                {selected.size > 0 && <button className="btn-ghost px-3 py-1.5 text-xs" onClick={() => setSelected(new Set())}>Clear selection</button>}
+                <button className="btn-danger ml-auto px-3 py-1.5" disabled={selected.size === 0} onClick={() => setConfirming(true)}>
+                  Remove {selected.size || ""}
+                </button>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm">
+                  Remove <b>{selected.size}</b> Pokémon from your vault? Their scan items go back to Review. Nothing changes in the game.
+                </span>
+                <div className="ml-auto flex gap-2">
+                  <button className="btn-ghost px-3 py-1.5" onClick={() => setConfirming(false)} disabled={busy}>Cancel</button>
+                  <button className="btn-danger px-3 py-1.5" onClick={removeSelected} disabled={busy}>
+                    {busy ? "Removing…" : `Remove ${selected.size}`}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -6,6 +6,7 @@ import Automation from "./Automation";
 export default function Settings({ onLogout }: { onLogout: () => void }) {
   const { data, error, loading, reload } = useAsync(() => api("/api/settings"), []);
   const [phrase, setPhrase] = useState("");
+  const [vaultPhrase, setVaultPhrase] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
   const [dark, setDark] = useState(document.documentElement.classList.contains("dark"));
 
@@ -77,7 +78,24 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
           <a className="btn-ghost" href="/api/privacy/export" download>Export all data (JSON)</a>
           <a className="btn-ghost" href="/api/export/collection.csv" download>Collection CSV</a>
         </div>
-        <div className="mt-5 rounded-xl p-4 ring-1 ring-rose-500/30">
+        <div className="mt-5 rounded-xl p-4 ring-1 ring-amber-500/40">
+          <div className="font-semibold text-amber-600 dark:text-amber-400">Clear vault</div>
+          <p className="mt-1 text-xs text-slate-500">
+            Removes every Pokémon from your vault. Your scans stay, and their items go back to Review so you can
+            confirm them again. Nothing changes in Pokémon GO. Type <b>DELETE</b> to confirm.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <input className="input" value={vaultPhrase} onChange={(e) => setVaultPhrase(e.target.value)} placeholder="DELETE"
+              autoCapitalize="characters" autoComplete="off" />
+            <button className="btn-danger whitespace-nowrap" disabled={vaultPhrase !== "DELETE"}
+              onClick={() => run(async () => {
+                const r = await api<{ removed: number }>("/api/pokemon/clear", { method: "POST", body: { confirm: vaultPhrase } });
+                setVaultPhrase("");
+                return r;
+              }, "Vault cleared. Your scans' items are back in Review.")}>Clear vault</button>
+          </div>
+        </div>
+        <div className="mt-4 rounded-xl p-4 ring-1 ring-rose-500/30">
           <div className="font-semibold text-rose-600">Delete everything</div>
           <p className="mt-1 text-xs text-slate-500">Permanently deletes every Pokémon, scan, frame, video and setting on this server. Type <b>DELETE ALL</b> to confirm.</p>
           <div className="mt-2 flex gap-2">

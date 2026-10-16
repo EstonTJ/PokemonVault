@@ -5,10 +5,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import Response
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from ..auth import Owner
+from ..catalog.importer import decide_status, refresh_candidates
 from ..validation import InvalidInput, check_pokemon_invariants, clean_pokemon_input
 from ..db import get_db
 from ..export.exporters import collection_csv, collection_json
@@ -163,13 +164,66 @@ def add_manual(body: Any = Body(...), db: Session = Depends(get_db)):
 
 @router.delete("/pokemon/{pid}")
 def delete_pokemon(pid: str, db: Session = Depends(get_db)):
-    p = db.get(Pokemon, pid) or _404()
-    for g in db.scalars(select(ObservationGroup).where(ObservationGroup.pokemon_id == pid)).all():
-        g.status, g.pokemon_id = "needs_review", None
-        g.review_reasons = list(g.review_reasons or []) + ["Previously confirmed Pokémon was deleted."]
-    db.delete(p)
+    db.get(Pokemon, pid) or _404()
+    remove_pokemon(db, [pid])
     db.commit()
     return {"ok": True}
+
+
+MAX_BULK = 5000
+
+
+@router.post("/pokemon/bulk-delete")
+def bulk_delete(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+        raise HTTPException(400, "ids must be a non-empty list of Pokémon ids.")
+    if len(ids) > MAX_BULK:
+        raise HTTPException(400, f"At most {MAX_BULK} at a time.")
+    found = [pid for (pid,) in db.execute(select(Pokemon.id).where(Pokemon.id.in_(set(ids))))]
+    remove_pokemon(db, found)
+    db.commit()
+    return {"removed": len(found), "not_found": len(set(ids)) - len(found)}
+
+
+@router.post("/pokemon/clear")
+def clear_vault(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+    if body.get("confirm") != "DELETE":
+        raise HTTPException(400, "Type DELETE to confirm.")
+    ids = [pid for (pid,) in db.execute(select(Pokemon.id))]
+    remove_pokemon(db, ids)
+    db.commit()
+    return {"removed": len(ids)}
+
+
+def remove_pokemon(db: Session, ids: List[str]) -> None:
+    """Remove Pokémon from the vault (never touches the game). Shared by single, bulk and clear-all.
+
+    Scan items that were confirmed as these Pokémon go back to the review queue (re-evaluated, so
+    confident ones are 'ready' again), and identity suggestions pointing at them are dropped.
+    """
+    if not ids:
+        return
+    gone = set(ids)
+    affected = db.scalars(select(ObservationGroup).where(ObservationGroup.pokemon_id.in_(gone))).all()
+    db.execute(delete(Correction).where(Correction.target == "pokemon", Correction.target_id.in_(gone)))
+    db.execute(delete(Pokemon).where(Pokemon.id.in_(gone)))  # evidence rows cascade
+    db.flush()
+    for g in affected:
+        g.pokemon_id, g.status, g.link_method = None, "needs_review", None
+    db.flush()  # the session doesn't autoflush; make the reset visible to the query below
+    pending = db.scalars(select(ObservationGroup).where(ObservationGroup.status.in_(("needs_review", "ready")))).all()
+    for g in pending:
+        if g.candidate_pokemon_ids and any(c.get("pokemon_id") in gone for c in g.candidate_pokemon_ids):
+            g.candidate_pokemon_ids = [c for c in g.candidate_pokemon_ids if c.get("pokemon_id") not in gone]
+    for g in affected:
+        refresh_candidates(db, g)
+    for g in pending:
+        g.status = decide_status(g)
+    for scan_id in {g.scan_id for g in affected}:
+        scan = db.get(Scan, scan_id)
+        if scan is not None and scan.status == "done":
+            scan.status = "review"
 
 
 @router.get("/species")
