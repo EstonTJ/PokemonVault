@@ -29,7 +29,8 @@ from ..auth import Owner
 from ..config import settings
 from ..db import get_db
 from ..models import UploadChunk, UploadSession, utcnow
-from .scans import check_upload_allowed, looks_like_video, register_recording
+from .scans import _scan_by_sha, check_upload_allowed, looks_like_video, register_recording
+from .serialize import scan_json
 
 router = APIRouter(prefix="/api/uploads", dependencies=[Owner])
 
@@ -164,23 +165,29 @@ def complete(upload_id: str, db: Session = Depends(get_db)):
     part = Path(s.part_path)
     if not part.exists() or part.stat().st_size != s.size_bytes:
         raise HTTPException(409, "The partial file is incomplete on the server. Start the upload again.")
-    h = hashlib.sha256()
-    with open(part, "rb") as fh:
-        head = fh.read(16)
-        h.update(head)
-        for block in iter(lambda: fh.read(4 * 1024 * 1024), b""):
-            h.update(block)
+    digest, head = _hash_file(part)
     if not looks_like_video(head):
         _abort(db, s)
         raise HTTPException(415, "File does not look like a MOV/MP4 video.")
     ext = os.path.splitext(s.filename)[1].lower()
+
+    existing = _scan_by_sha(db, digest)
+    if existing is not None and not s.reprocess:
+        # Already imported. Keep this copy briefly so "Rescan" can use it instead of uploading it all again.
+        s.status, s.scan_id, s.updated_at = "held", existing.id, utcnow()
+        db.query(UploadChunk).filter(UploadChunk.upload_id == upload_id).delete()
+        db.commit()
+        return {"duplicate": True, "scan": scan_json(existing),
+                "held_upload_id": s.id, "held_minutes": settings.upload_hold_minutes,
+                "message": "This exact recording was already imported. You can rescan it now without uploading "
+                           "it again; confirmed Pokémon will be re-linked, not duplicated."}
     # Mark complete first: register_recording takes ownership of the file and commits.
     s.status = "complete"
     db.query(UploadChunk).filter(UploadChunk.upload_id == upload_id).delete()
     db.flush()
     try:
         resp = register_recording(db, part, filename=s.filename, ext=ext, kind=s.kind, keep_video=s.keep_video,
-                                  reprocess=s.reprocess, size=s.size_bytes, digest=h.hexdigest())
+                                  reprocess=s.reprocess, size=s.size_bytes, digest=digest)
     except HTTPException:
         # Refused (e.g. this recording is already processing). The file is gone, so close the session out.
         db.rollback()
@@ -192,10 +199,45 @@ def complete(upload_id: str, db: Session = Depends(get_db)):
     return resp
 
 
+@router.post("/{upload_id}/rescan")
+def rescan_held(upload_id: str, db: Session = Depends(get_db)):
+    """Rescan an already-imported recording using the copy that was just uploaded (no second upload)."""
+    s = db.get(UploadSession, upload_id)
+    expired_before = utcnow() - timedelta(minutes=settings.upload_hold_minutes)
+    if s is None or s.status != "held" or s.updated_at < expired_before or not os.path.exists(s.part_path):
+        raise HTTPException(410, "The uploaded copy is no longer kept. Upload the recording again to rescan it.")
+    part = Path(s.part_path)
+    digest, _ = _hash_file(part)
+    ext = os.path.splitext(s.filename)[1].lower()
+    s.status = "complete"
+    db.flush()
+    try:
+        resp = register_recording(db, part, filename=s.filename, ext=ext, kind=s.kind, keep_video=s.keep_video,
+                                  reprocess=True, size=s.size_bytes, digest=digest)
+    except HTTPException:
+        db.rollback()
+        s = db.get(UploadSession, upload_id)
+        if s is not None:
+            _abort(db, s)
+        raise
+    db.commit()
+    return resp
+
+
+def _hash_file(path: Path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        head = fh.read(16)
+        h.update(head)
+        for block in iter(lambda: fh.read(4 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest(), head
+
+
 @router.delete("/{upload_id}")
 def abort(upload_id: str, db: Session = Depends(get_db)):
     s = db.get(UploadSession, upload_id)
-    if s is not None and s.status == "open":
+    if s is not None and s.status in ("open", "held"):
         _abort(db, s)
     return {"ok": True}
 
@@ -220,6 +262,11 @@ def sweep_expired_uploads() -> int:
                                                         UploadSession.updated_at < _expired_before())).all():
             _abort(db, s)
             n += 1
+        held_before = utcnow() - timedelta(minutes=settings.upload_hold_minutes)
+        for s in db.scalars(select(UploadSession).where(UploadSession.status == "held",
+                                                        UploadSession.updated_at < held_before)).all():
+            _abort(db, s)  # nobody rescanned it: delete the raw copy
+            n += 1
         # Bookkeeping rows of finished or cancelled uploads are only useful briefly.
         db.query(UploadSession).filter(UploadSession.status != "open",
                                        UploadSession.updated_at < _expired_before()).delete()
@@ -227,7 +274,8 @@ def sweep_expired_uploads() -> int:
     # Orphaned part files (e.g. a crash between creating the file and committing the session).
     known = set()
     with dbmod.SessionLocal() as db:
-        known = {p for (p,) in db.execute(select(UploadSession.part_path).where(UploadSession.status == "open"))}
+        known = {p for (p,) in db.execute(select(UploadSession.part_path).where(
+            UploadSession.status.in_(("open", "held"))))}
     if settings.partial_dir.exists():
         import time
 

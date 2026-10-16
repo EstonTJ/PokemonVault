@@ -280,7 +280,7 @@ class UploadSession(Base):
     kind: Mapped[str] = mapped_column(String(16), default="auto")
     keep_video: Mapped[bool] = mapped_column(Boolean, default=False)
     reprocess: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[str] = mapped_column(String(16), default="open")  # open | complete | aborted
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open | held | complete | aborted
     part_path: Mapped[str] = mapped_column(String(512))
     scan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("scans.id", ondelete="SET NULL"), nullable=True)
 

@@ -113,7 +113,9 @@ def test_duplicate_recording_and_non_video(client, video):
     assert first.status_code == 201
     s2, second = _upload_all(client, video, last_modified=222)
     assert second.status_code == 200 and second.json()["duplicate"] is True
-    assert client.get(f"/api/uploads/{s2['id']}").json()["status"] == "complete"
+    assert client.get(f"/api/uploads/{s2['id']}").json()["status"] == "held"
+    client.delete(f"/api/uploads/{s2['id']}", headers=H)  # not rescanning: the held copy is deleted
+    assert not os.path.exists(os.path.join(_partial_dir(), f"{s2['id']}.part"))
     # Reprocessing while the first job is still queued is refused, and the session is cleaned up.
     s3, third = _upload_all(client, video, last_modified=333, reprocess=True)
     assert third.status_code == 409
@@ -178,3 +180,52 @@ def test_requires_owner_and_csrf(fresh_db):
         assert c.post("/api/uploads", json={"filename": "a.mp4", "size": 10}, headers=H).status_code == 401
         c.post("/api/auth/login", json={"password": "test-password"})
         assert c.post("/api/uploads", json={"filename": "a.mp4", "size": 10}).status_code == 403
+
+
+def test_rescan_reuses_the_held_upload_without_reuploading(client, video):
+    from app.jobs.worker import run_one
+
+    _, first = _upload_all(client, video)
+    scan_id = first.json()["scan"]["id"]
+    assert run_one("t")  # first processing finishes; raw video deleted
+
+    s2, dup = _upload_all(client, video, last_modified=222)
+    body = dup.json()
+    assert body["duplicate"] is True and body["held_upload_id"] == s2["id"]
+    part = os.path.join(_partial_dir(), f"{s2['id']}.part")
+    assert os.path.exists(part)
+
+    puts_before = _count_chunk_puts(client)
+    r = client.post(f"/api/uploads/{s2['id']}/rescan", headers=H)
+    assert r.status_code == 201, r.text
+    assert r.json()["reprocessed"] is True and r.json()["scan"]["id"] == scan_id
+    assert r.json()["scan"]["job"]["status"] == "queued"
+    assert _count_chunk_puts(client) == puts_before  # nothing was uploaded again
+    assert not os.path.exists(part)  # moved into place for processing
+    assert run_one("t")
+    assert client.get(f"/api/scans/{scan_id}").json()["status"] in ("review", "done")
+    assert client.post(f"/api/uploads/{s2['id']}/rescan", headers=H).status_code == 410  # used up
+
+
+def _count_chunk_puts(client):
+    from app import db as dbmod
+    from app.models import UploadChunk
+
+    with dbmod.SessionLocal() as db:
+        return db.query(UploadChunk).count()
+
+
+def test_held_copy_expires_and_is_deleted(client, video):
+    from app import db as dbmod
+    from app.api.uploads import sweep_expired_uploads
+    from app.models import UploadSession, utcnow
+
+    _upload_all(client, video)
+    s2, _ = _upload_all(client, video, last_modified=222)
+    part = os.path.join(_partial_dir(), f"{s2['id']}.part")
+    with dbmod.SessionLocal() as db:
+        db.get(UploadSession, s2["id"]).updated_at = utcnow() - timedelta(hours=2)
+        db.commit()
+    assert client.post(f"/api/uploads/{s2['id']}/rescan", headers=H).status_code == 410
+    sweep_expired_uploads()
+    assert not os.path.exists(part)

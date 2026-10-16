@@ -23,6 +23,8 @@ export default function Upload() {
   const [limitMb, setLimitMb] = useState<number | null>(null);
   const abortRef = useRef<AbortController>();
   const sessionRef = useRef<string>();
+  const [heldId, setHeldId] = useState<string | null>(null);
+  const [rescanning, setRescanning] = useState(false);
 
   useEffect(() => { api("/api/settings").then((s) => setLimitMb(s.limits.max_upload_mb)).catch(() => {}); }, []);
 
@@ -41,7 +43,7 @@ export default function Upload() {
   }, [phase, scan?.id]);
 
   function choose(f: File | null) {
-    setErr(null); setPhase("idle"); setScan(null);
+    setErr(null); setPhase("idle"); setScan(null); setHeldId(null);
     if (!f) return setFile(null);
     const ok = /\.(mov|mp4|m4v)$/i.test(f.name);
     if (!ok) { setErr("Choose a MOV or MP4 screen recording."); return setFile(null); }
@@ -59,11 +61,32 @@ export default function Upload() {
         (id) => { sessionRef.current = id; });
       sessionRef.current = undefined;
       setScan(data.scan);
+      setHeldId(data.duplicate ? data.held_upload_id ?? null : null);
       setPhase(data.duplicate ? "duplicate" : "processing");
     } catch (e) {
       if (ctrl.signal.aborted) { setPhase((p) => (p === "idle" ? p : "paused")); return; }
       setErr((e as ApiError).message); setPhase("error");
     }
+  }
+
+  async function rescan() {
+    // Reuse the copy the server kept from the upload that just finished: no second upload.
+    if (heldId) {
+      setRescanning(true); setErr(null);
+      try {
+        const data = await api<any>(`/api/uploads/${heldId}/rescan`, { method: "POST" });
+        setHeldId(null);
+        setScan(data.scan);
+        setPhase("processing");
+        return;
+      } catch (e: any) {
+        if (!(e instanceof ApiError) || e.status !== 410) { setErr(e.message); return; }
+        // The kept copy expired: fall back to uploading it again.
+      } finally {
+        setRescanning(false);
+      }
+    }
+    start(true);
   }
 
   function pause() {
@@ -205,10 +228,16 @@ export default function Upload() {
         {phase === "duplicate" && scan && (
           <div className="mt-5 rounded-xl bg-sky-500/10 p-3 text-sm ring-1 ring-sky-500/20">
             <div className="font-semibold">You've already imported this exact recording.</div>
-            <p className="mt-1 text-slate-600 dark:text-slate-300">Nothing was duplicated. You can rescan it: Pokémon you already confirmed from it are re-linked, not added twice.</p>
+            <p className="mt-1 text-slate-600 dark:text-slate-300">
+              Nothing was duplicated. You can rescan it with the latest scanner: Pokémon you already confirmed from it are
+              re-linked, not added twice.
+              {heldId && " The file you just uploaded is used, so there's no second upload. It's deleted within an hour if you don't rescan."}
+            </p>
             <div className="mt-3 flex gap-2">
               <Link className="btn-ghost flex-1" to={`/review/scan/${scan.id}`}>Open existing scan</Link>
-              <button className="btn-primary flex-1" onClick={() => start(true)}>Rescan</button>
+              <button className="btn-primary flex-1" onClick={rescan} disabled={rescanning}>
+                {rescanning ? "Starting rescan…" : heldId ? "Rescan now" : "Rescan"}
+              </button>
             </div>
           </div>
         )}

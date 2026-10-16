@@ -41,6 +41,8 @@ class Settings:
     upload_chunk_mb: int = field(default_factory=lambda: _env_int("POKEVAULT_UPLOAD_CHUNK_MB", 8))
     upload_session_ttl_h: int = field(default_factory=lambda: _env_int("POKEVAULT_UPLOAD_SESSION_TTL_H", 24))
     max_open_upload_sessions: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_OPEN_UPLOADS", 3))
+    # A just-uploaded recording that turns out to be a duplicate is kept this long so "Rescan" needn't re-upload it.
+    upload_hold_minutes: int = field(default_factory=lambda: _env_int("POKEVAULT_UPLOAD_HOLD_MINUTES", 60))
     max_duration_s: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_DURATION_S", 900))
     max_uploads_per_hour: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_UPLOADS_PER_HOUR", 20))
     max_keyframes: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_KEYFRAMES", 400))
