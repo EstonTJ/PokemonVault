@@ -29,3 +29,12 @@ def fresh_db(tmp_path):
     upgrade(url)
     dbmod.configure(url)
     yield dbmod
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_limits():
+    from app import auth
+
+    auth._attempts.clear()
+    auth._global_failures.clear()
+    yield

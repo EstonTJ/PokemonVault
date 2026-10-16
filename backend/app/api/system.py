@@ -37,7 +37,7 @@ def login(request: Request, response: Response, body: Dict[str, str] = Body(...)
     return {"authenticated": True}
 
 
-@public.post("/auth/logout")
+@public.post("/auth/logout", dependencies=[Depends(auth.require_csrf_header)])
 def logout(response: Response):
     auth.logout(response)
     return {"authenticated": False}

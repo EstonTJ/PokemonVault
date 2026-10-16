@@ -70,8 +70,11 @@ volume, or a $5 VPS) can run `start.sh` directly with SQLite and no extra databa
 
 ## Privacy & security summary
 
-* Single owner password. Signed HttpOnly SameSite=Strict cookie. Every write needs an `X-PokeVault` header (CSRF).
-  Login attempts are rate-limited.
+* Single owner password. Signed HttpOnly SameSite=Strict cookie. Every write, including logout, needs an
+  `X-PokeVault` header (CSRF). Failed logins and invalid upload keys are limited per client **and** globally,
+  so spoofing IP addresses doesn't bypass the limit (under attack, sign-in may pause for up to 10 minutes).
+* Forwarded client-IP headers are only trusted from `FORWARDED_ALLOW_IPS` (default `127.0.0.1`). Set it to
+  your host's proxy range if you want real client IPs in per-client limits; never use `*`.
 * Uploads are streamed with size, duration, hourly-count and concurrency limits, and checked for MOV/MP4 magic bytes.
 * Raw videos are deleted after processing by default. A failed or cancelled scan keeps its video for Retry,
   and the video is swept after 24 hours.

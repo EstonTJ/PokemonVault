@@ -48,9 +48,15 @@ def init_auth() -> None:
     _serializer = URLSafeTimedSerializer(secret, salt="pokevault-session")
 
 
-# Login rate limiting (per client address)
+# Brute-force protection.
+# Per-client limits can be dodged by anyone who can vary their apparent IP (proxies, spoofed headers), so failed
+# attempts are ALSO capped globally. Under attack this can briefly lock the owner out too; that is the
+# deliberate trade-off for a single-password app.
 _attempts: Dict[str, Deque[float]] = defaultdict(deque)
-MAX_ATTEMPTS = 8
+_global_failures: Dict[str, Deque[float]] = defaultdict(deque)
+MAX_ATTEMPTS = 8                 # failed logins per client per window
+MAX_GLOBAL_FAILURES = 30         # failed logins from all clients per window
+MAX_KEY_FAILURES = 30            # invalid upload keys from all clients per window
 WINDOW_S = 600
 
 
@@ -58,18 +64,23 @@ def _client(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def login(request: Request, response: Response, password: str) -> None:
-    key = _client(request)
-    q = _attempts[key]
-    now = time.time()
+def _prune(q: Deque[float], now: float) -> Deque[float]:
     while q and now - q[0] > WINDOW_S:
         q.popleft()
-    if len(q) >= MAX_ATTEMPTS:
+    return q
+
+
+def login(request: Request, response: Response, password: str) -> None:
+    now = time.time()
+    mine = _prune(_attempts[_client(request)], now)
+    everyone = _prune(_global_failures["login"], now)
+    if len(mine) >= MAX_ATTEMPTS or len(everyone) >= MAX_GLOBAL_FAILURES:
         raise HTTPException(429, "Too many login attempts. Try again later.")
-    q.append(now)
     if not hmac.compare_digest(password.encode(), _password.encode()):
+        mine.append(now)
+        everyone.append(now)
         raise HTTPException(401, "Incorrect password.")
-    q.clear()
+    mine.clear()
     token = _serializer.dumps({"owner": True, "iat": int(now)})
     response.set_cookie(COOKIE, token, max_age=settings.session_max_age_s, httponly=True, samesite="strict",
                         secure=settings.secure_cookies, path="/")
@@ -162,23 +173,22 @@ def require_owner_or_upload_key(request: Request) -> str:
     if header.lower().startswith("bearer "):
         from .db import SessionLocal
 
-        key = header[7:].strip()
-        _throttle(request)
+        now = time.time()
+        mine = _prune(_attempts["key:" + _client(request)], now)
+        everyone = _prune(_global_failures["upload_key"], now)
+        if len(mine) >= MAX_ATTEMPTS or len(everyone) >= MAX_KEY_FAILURES:
+            raise HTTPException(429, "Too many invalid upload attempts. Try again later.")
         with SessionLocal() as db:
-            if check_upload_key(db, key):
+            if check_upload_key(db, header[7:].strip()):
                 return "upload_key"
+        mine.append(now)
+        everyone.append(now)
         raise HTTPException(401, "Invalid upload key.")
     require_owner(request)
     return "session"
 
 
-def _throttle(request: Request) -> None:
-    """Share the login limiter for key attempts so keys can't be brute-forced."""
-    key = "key:" + _client(request)
-    q = _attempts[key]
-    now = time.time()
-    while q and now - q[0] > WINDOW_S:
-        q.popleft()
-    if len(q) >= MAX_ATTEMPTS * 10:
-        raise HTTPException(429, "Too many upload attempts. Try again later.")
-    q.append(now)
+def require_csrf_header(request: Request) -> None:
+    """For state-changing endpoints that don't need a session (e.g. logout)."""
+    if request.headers.get(CSRF_HEADER) != "1":
+        raise HTTPException(403, "Missing request header.")
