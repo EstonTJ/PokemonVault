@@ -71,9 +71,11 @@ def _discard_attempt(scan_id: int, attempt_id: str) -> None:
 
 def sweep() -> None:
     """Delete raw videos left behind by failed/cancelled scans (kept briefly so Retry works)."""
+    from ..api.uploads import sweep_expired_uploads
     from ..pipeline import sweep_stale_media
 
     sweep_stale_media()
+    sweep_expired_uploads()
 
 
 class WorkerThread(threading.Thread):

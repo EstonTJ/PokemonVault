@@ -1,20 +1,28 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, Scan, uploadVideo } from "../api";
+import { api, ApiError, cancelUpload, Scan, uploadResumable, UploadProgress } from "../api";
 import { ErrorBox, PageHeader, ProgressBar, StatusPill } from "../ui";
 
-type Phase = "idle" | "uploading" | "processing" | "finished" | "duplicate" | "error";
+type Phase = "idle" | "uploading" | "paused" | "processing" | "finished" | "duplicate" | "error";
+
+const mb = (n: number) => (n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(2)} GB` : `${(n / 1024 ** 2).toFixed(0)} MB`);
+function eta(p: UploadProgress) {
+  if (p.bytesPerSec < 1) return "";
+  const s = (p.totalBytes - p.sentBytes) / p.bytesPerSec;
+  return s < 60 ? `~${Math.max(1, Math.round(s))}s left` : `~${Math.round(s / 60)} min left`;
+}
 
 export default function Upload() {
   const [file, setFile] = useState<File | null>(null);
   const [kind, setKind] = useState("auto");
   const [keepVideo, setKeepVideo] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
-  const [uploadFrac, setUploadFrac] = useState(0);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [scan, setScan] = useState<Scan | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [limitMb, setLimitMb] = useState<number | null>(null);
-  const abortRef = useRef<() => void>();
+  const abortRef = useRef<AbortController>();
+  const sessionRef = useRef<string>();
 
   useEffect(() => { api("/api/settings").then((s) => setLimitMb(s.limits.max_upload_mb)).catch(() => {}); }, []);
 
@@ -43,20 +51,33 @@ export default function Upload() {
 
   async function start(reprocess = false) {
     if (!file) return;
-    setErr(null); setPhase("uploading"); setUploadFrac(0);
-    const { promise, abort } = uploadVideo(file, { kind, keep_video: keepVideo, reprocess }, setUploadFrac);
-    abortRef.current = abort;
+    setErr(null); setPhase("uploading"); setProgress(null);
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     try {
-      const { data } = await promise;
+      const { data } = await uploadResumable(file, { kind, keep_video: keepVideo, reprocess }, setProgress, ctrl.signal,
+        (id) => { sessionRef.current = id; });
+      sessionRef.current = undefined;
       setScan(data.scan);
       setPhase(data.duplicate ? "duplicate" : "processing");
     } catch (e) {
+      if (ctrl.signal.aborted) { setPhase((p) => (p === "idle" ? p : "paused")); return; }
       setErr((e as ApiError).message); setPhase("error");
     }
   }
 
+  function pause() {
+    abortRef.current?.abort();  // the server keeps what it has; Resume continues from there
+  }
+
   async function cancel() {
-    if (phase === "uploading") { abortRef.current?.(); return; }
+    if (phase === "uploading" || phase === "paused" || phase === "error") {
+      abortRef.current?.abort();
+      if (sessionRef.current) await cancelUpload(sessionRef.current);
+      sessionRef.current = undefined;
+      setPhase("idle"); setProgress(null);
+      return;
+    }
     if (!scan) return;
     try { await api(`/api/scans/${scan.id}/cancel`, { method: "POST" }); } catch (e: any) { setErr(e.message); }
   }
@@ -112,19 +133,44 @@ export default function Upload() {
 
         {err && <div className="mt-4"><ErrorBox error={err} /></div>}
 
-        {phase === "idle" || phase === "error" ? (
-          <button className="btn-primary mt-5 w-full" disabled={!file} onClick={() => start()}>
-            {phase === "error" ? "Retry upload" : "Upload & scan"}
-          </button>
+        {phase === "idle" || phase === "error" || phase === "paused" ? (
+          <div className="mt-5 flex gap-2">
+            <button className="btn-primary flex-1" disabled={!file} onClick={() => start()}>
+              {phase === "idle" ? "Upload & scan" : "Resume upload"}
+            </button>
+            {phase !== "idle" && <button className="btn-ghost" onClick={cancel}>Cancel</button>}
+          </div>
         ) : null}
 
-        {phase === "uploading" && (
+        {(phase === "uploading" || phase === "paused") && progress && (
           <div className="mt-5 space-y-2">
-            <div className="flex justify-between text-xs text-slate-500"><span>Uploading…</span><span>{Math.round(uploadFrac * 100)}%</span></div>
-            <ProgressBar value={uploadFrac} />
-            <button className="btn-ghost w-full" onClick={cancel}>Cancel upload</button>
+            <div className="flex justify-between gap-2 text-xs text-slate-500">
+              <span>
+                {phase === "paused" ? "Paused" : progress.phase === "finishing" ? "Checking the file…"
+                  : progress.phase === "waiting" ? "Connection trouble, retrying…" : "Uploading…"}
+                {" "}{mb(progress.sentBytes)} of {mb(progress.totalBytes)}
+              </span>
+              <span className="tabular-nums">
+                {phase === "uploading" && progress.phase === "sending" && progress.bytesPerSec > 0
+                  ? `${mb(progress.bytesPerSec)}/s · ${eta(progress)}` : `${Math.round((progress.sentBytes / progress.totalBytes) * 100)}%`}
+              </span>
+            </div>
+            <ProgressBar value={progress.sentBytes / progress.totalBytes} />
+            {progress.resumedBytes > 0 && (
+              <div className="text-xs text-emerald-600 dark:text-emerald-400">Resumed: {mb(progress.resumedBytes)} was already uploaded.</div>
+            )}
+            {phase === "uploading" && progress.phase !== "finishing" && (
+              <div className="flex gap-2">
+                <button className="btn-ghost flex-1" onClick={pause}>Pause</button>
+                <button className="btn-ghost flex-1" onClick={cancel}>Cancel upload</button>
+              </div>
+            )}
+            {phase === "paused" && (
+              <p className="text-xs text-slate-500">What's uploaded is kept for 24 hours. Pick the same file to resume, even after closing this page.</p>
+            )}
           </div>
         )}
+        {phase === "uploading" && !progress && <div className="mt-5 text-xs text-slate-500">Starting upload…</div>}
 
         {(phase === "processing" || phase === "finished") && scan && (
           <div className="mt-5 space-y-3">
@@ -171,6 +217,7 @@ export default function Upload() {
       <div className="mt-6 space-y-3 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
         <p><b className="text-slate-700 dark:text-slate-200">Where your video goes.</b> The recording is uploaded only to your own PokéVault server (your Replit deployment) and processed there with local FFmpeg and OCR. It is never sent to Niantic, to Pokémon GO, or to any AI service.</p>
         <p><b className="text-slate-700 dark:text-slate-200">What's kept.</b> The raw video is deleted after processing unless you choose to keep it. Only the downscaled frames used as evidence are retained, and you can purge them from Scan history.</p>
+        <p><b className="text-slate-700 dark:text-slate-200">Big files.</b> Recordings up to {limitMb ? mb(limitMb * 1024 * 1024) : "1 GB"} upload in small pieces. If your connection drops, the upload waits and carries on. If you leave the page, choose the same file again within 24 hours to resume where it stopped.</p>
         <p><b className="text-slate-700 dark:text-slate-200">Recording tips.</b> Scroll the storage grid slowly and pause briefly every screen. Open a Pokémon's detail page for HP and candy, then tap Appraise to read IV bars.</p>
       </div>
     </div>

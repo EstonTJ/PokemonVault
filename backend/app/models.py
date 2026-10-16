@@ -261,3 +261,38 @@ class GamedataVersion(Base):
     source_timestamp: Mapped[str] = mapped_column(String(64))
     sha256: Mapped[str] = mapped_column(String(64))
     loaded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class UploadSession(Base):
+    """A resumable, chunked upload in progress. The file is assembled in place under private/partial/."""
+
+    __tablename__ = "upload_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    # name + size + last-modified of the browser's File: lets a reload pick the same session back up.
+    fingerprint: Mapped[str] = mapped_column(String(320), index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    chunk_size: Mapped[int] = mapped_column(Integer)
+    total_chunks: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(16), default="auto")
+    keep_video: Mapped[bool] = mapped_column(Boolean, default=False)
+    reprocess: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open | complete | aborted
+    part_path: Mapped[str] = mapped_column(String(512))
+    scan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("scans.id", ondelete="SET NULL"), nullable=True)
+
+    chunks: Mapped[list["UploadChunk"]] = relationship(cascade="all, delete-orphan")
+
+
+class UploadChunk(Base):
+    """One received chunk. The (upload, index) primary key makes re-sending a chunk idempotent."""
+
+    __tablename__ = "upload_chunks"
+
+    upload_id: Mapped[str] = mapped_column(ForeignKey("upload_sessions.id", ondelete="CASCADE"), primary_key=True)
+    index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    size: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))

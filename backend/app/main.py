@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 
-from .api import collection, scans, system
+from .api import collection, scans, system, uploads
 from .auth import init_auth
 from .config import settings
 from .jobs.worker import WorkerThread
@@ -36,6 +36,7 @@ app = FastAPI(title="PokéVault", lifespan=lifespan, docs_url=None, redoc_url=No
 app.include_router(system.public)
 app.include_router(system.router)
 app.include_router(scans.upload_router)
+app.include_router(uploads.router)
 app.include_router(scans.router)
 app.include_router(collection.router)
 

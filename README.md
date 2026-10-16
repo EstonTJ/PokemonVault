@@ -103,6 +103,15 @@ iOS doesn't let apps or Shortcuts start screen recording, so starting the record
 The Shortcut steps have not been tested on a device yet. The server side was tested by sending the same
 request the Shortcut makes.
 
+## Large uploads (up to 1 GB)
+
+The browser uploads recordings in 8 MB chunks (`/api/uploads`). Each chunk is checksummed and retried
+automatically, and the upload waits out dropped connections. Pausing or leaving the page keeps what has
+arrived for 24 hours; choosing the same file again resumes from where it stopped. Limits:
+`POKEVAULT_MAX_UPLOAD_MB` (default 1024), `POKEVAULT_UPLOAD_CHUNK_MB` (8),
+`POKEVAULT_UPLOAD_SESSION_TTL_H` (24), `POKEVAULT_MAX_OPEN_UPLOADS` (3). The iPhone Shortcut still uses the
+single-request `POST /api/scans`, with the same size limit.
+
 ## Recording tips
 
 * Storage grid: scroll slowly and pause about half a second on each screen.

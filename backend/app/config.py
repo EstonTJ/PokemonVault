@@ -37,7 +37,10 @@ class Settings:
     session_max_age_s: int = field(default_factory=lambda: _env_int("POKEVAULT_SESSION_MAX_AGE_S", 14 * 24 * 3600))
 
     # Upload / processing limits
-    max_upload_mb: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_UPLOAD_MB", 600))
+    max_upload_mb: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_UPLOAD_MB", 1024))
+    upload_chunk_mb: int = field(default_factory=lambda: _env_int("POKEVAULT_UPLOAD_CHUNK_MB", 8))
+    upload_session_ttl_h: int = field(default_factory=lambda: _env_int("POKEVAULT_UPLOAD_SESSION_TTL_H", 24))
+    max_open_upload_sessions: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_OPEN_UPLOADS", 3))
     max_duration_s: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_DURATION_S", 900))
     max_uploads_per_hour: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_UPLOADS_PER_HOUR", 20))
     max_keyframes: int = field(default_factory=lambda: _env_int("POKEVAULT_MAX_KEYFRAMES", 400))
@@ -80,11 +83,19 @@ class Settings:
         return self.private_dir / "frames"
 
     @property
+    def upload_chunk_bytes(self) -> int:
+        return self.upload_chunk_mb * 1024 * 1024
+
+    @property
+    def partial_dir(self) -> Path:
+        return self.private_dir / "partial"
+
+    @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
 
     def ensure_dirs(self) -> None:
-        for d in (self.data_dir, self.private_dir, self.upload_dir, self.frame_dir):
+        for d in (self.data_dir, self.private_dir, self.upload_dir, self.frame_dir, self.partial_dir):
             d.mkdir(parents=True, exist_ok=True)
             try:
                 os.chmod(d, 0o700)

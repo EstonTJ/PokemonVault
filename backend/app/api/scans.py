@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -37,18 +38,14 @@ def _latest_job(db: Session, scan_id: int) -> Optional[Job]:
     return db.scalars(select(Job).where(Job.scan_id == scan_id).order_by(Job.id.desc()).limit(1)).first()
 
 
-@upload_router.post("/scans", status_code=201)
-async def upload(request: Request, filename: str = Query(..., max_length=255), kind: str = Query("auto"),
-                 keep_video: bool = Query(False), reprocess: bool = Query(False), db: Session = Depends(get_db),
-                 auth_method: str = Depends(require_owner_or_upload_key)):
-    """Raw-body upload (the browser sends the File as the request body) so limits apply while streaming."""
+def check_upload_allowed(db: Session, filename: str, kind: str, size: Optional[int]) -> str:
+    """Checks shared by every upload path. Returns the validated file extension."""
     if kind not in ("auto", "collection", "appraisal"):
         raise HTTPException(400, "kind must be auto, collection or appraisal.")
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXT:
         raise HTTPException(415, "Only MOV and MP4 recordings are supported.")
-    declared = request.headers.get("content-length")
-    if declared and int(declared) > settings.max_upload_bytes:
+    if size is not None and size > settings.max_upload_bytes:
         raise HTTPException(413, f"File is larger than the {settings.max_upload_mb} MB limit.")
     since = utcnow() - timedelta(hours=1)
     recent = db.query(Scan).filter(Scan.created_at >= since, Scan.is_demo.is_(False)).count()
@@ -57,32 +54,20 @@ async def upload(request: Request, filename: str = Query(..., max_length=255), k
     active = db.query(Job).filter(Job.status.in_(("queued", "running"))).count()
     if active >= 3:
         raise HTTPException(429, "Several recordings are already processing; wait for them to finish.")
+    return ext
 
-    settings.ensure_dirs()
-    tmp = settings.upload_dir / f"incoming-{os.urandom(8).hex()}{ext}"
-    h = hashlib.sha256()
-    size = 0
-    head = b""
-    try:
-        with open(tmp, "wb") as fh:
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > settings.max_upload_bytes:
-                    raise HTTPException(413, f"File is larger than the {settings.max_upload_mb} MB limit.")
-                if len(head) < 16:
-                    head += chunk[: 16 - len(head)]
-                h.update(chunk)
-                fh.write(chunk)
-        if size == 0:
-            raise HTTPException(400, "Empty upload.")
-        if head[4:8] not in _ATOMS:
-            raise HTTPException(415, "File does not look like a MOV/MP4 video.")
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+
+def looks_like_video(head: bytes) -> bool:
+    return len(head) >= 8 and head[4:8] in _ATOMS
+
+
+def register_recording(db: Session, tmp: Path, *, filename: str, ext: str, kind: str, keep_video: bool,
+                       reprocess: bool, size: int, digest: str):
+    """Turn a fully received, private temp file into a scan + job (or a duplicate response).
+
+    Owns `tmp`: it is moved into place or deleted.
+    """
     os.chmod(tmp, 0o600)
-    digest = h.hexdigest()
-
     existing = _scan_by_sha(db, digest)
     if existing is not None and not reprocess:
         tmp.unlink(missing_ok=True)
@@ -117,7 +102,42 @@ async def upload(request: Request, filename: str = Query(..., max_length=255), k
     scan.keep_video = keep_video
     scan.kind = kind
     db.commit()
-    return {"duplicate": False, "reprocessed": existing is not None, "scan": scan_json(scan, job)}
+    return JSONResponse({"duplicate": False, "reprocessed": existing is not None, "scan": scan_json(scan, job)},
+                        status_code=201)
+
+
+@upload_router.post("/scans", status_code=201)
+async def upload(request: Request, filename: str = Query(..., max_length=255), kind: str = Query("auto"),
+                 keep_video: bool = Query(False), reprocess: bool = Query(False), db: Session = Depends(get_db),
+                 auth_method: str = Depends(require_owner_or_upload_key)):
+    """Single-request upload (used by the iPhone Shortcut). The browser uses resumable chunked uploads instead."""
+    declared = request.headers.get("content-length")
+    ext = check_upload_allowed(db, filename, kind, int(declared) if declared and declared.isdigit() else None)
+
+    settings.ensure_dirs()
+    tmp = settings.upload_dir / f"incoming-{os.urandom(8).hex()}{ext}"
+    h = hashlib.sha256()
+    size = 0
+    head = b""
+    try:
+        with open(tmp, "wb") as fh:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > settings.max_upload_bytes:
+                    raise HTTPException(413, f"File is larger than the {settings.max_upload_mb} MB limit.")
+                if len(head) < 16:
+                    head += chunk[: 16 - len(head)]
+                h.update(chunk)
+                fh.write(chunk)
+        if size == 0:
+            raise HTTPException(400, "Empty upload.")
+        if not looks_like_video(head):
+            raise HTTPException(415, "File does not look like a MOV/MP4 video.")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return register_recording(db, tmp, filename=filename, ext=ext, kind=kind, keep_video=keep_video,
+                              reprocess=reprocess, size=size, digest=h.hexdigest())
 
 
 def _scan_by_sha(db: Session, digest: str) -> Optional[Scan]:
