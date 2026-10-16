@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+backend/var/
+frontend/node_modules/
+frontend/dist/
+.pytest_cache/
+.DS_Store
+
+# Local-only: machine paths and dev credentials
+.claude/
+.env
+.env.*
+# Private data: database, evidence frames, uploads, generated owner password/secret
+backend/var/
+*.db
+*.db-wal
+*.db-shm
+*.mp4
+*.mov
+*.MP4
+*.MOV
+
+# Build artifacts and packaged copies
+*.zip
+*.tsbuildinfo

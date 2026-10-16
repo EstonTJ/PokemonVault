@@ -1,0 +1,21 @@
+run = "bash start.sh"
+modules = ["python-3.11", "nodejs-20"]
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+POKEVAULT_SECURE_COOKIES = "1"
+
+[deployment]
+# Reserved VM: one always-on process running the API and the in-process job worker.
+# Autoscale scales to zero and would interrupt processing jobs.
+# NOTE: deployment filesystems are reset on each redeploy. Set POKEVAULT_DATABASE_URL to
+# Replit's PostgreSQL (see README) so the collection survives redeploys.
+deploymentTarget = "gce"
+build = ["bash", "-c", "pip install -r backend/requirements.txt && cd frontend && npm ci --no-audit --no-fund && npm run build"]
+run = ["bash", "start.sh"]
+
+[[ports]]
+localPort = 8000
+externalPort = 80
