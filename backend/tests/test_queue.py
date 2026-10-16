@@ -4,8 +4,12 @@ from app.jobs import queue
 from app.models import Job, Scan, utcnow
 
 
+_n = [0]
+
+
 def _scan(db):
-    s = Scan(original_filename="x.mov", sha256="abc", size_bytes=1)
+    _n[0] += 1
+    s = Scan(original_filename="x.mov", sha256=f"sha-{_n[0]}", size_bytes=1)
     db.add(s)
     db.flush()
     return s
@@ -55,7 +59,7 @@ def test_cancel_queued_and_running(fresh_db):
         running = queue.claim_next(db, "w1")
         queue.request_cancel(db, running)
         assert running.cancel_requested
-    ctx = queue.JobContext(fresh_db.SessionLocal, running.id, "w1")
+    ctx = queue.JobContext(fresh_db.SessionLocal, running.id, running.lease_token)
     try:
         ctx.update(0.5, "x")
         raised = False
@@ -70,8 +74,40 @@ def test_transient_failure_retries_permanent_does_not(fresh_db):
         queue.enqueue(db, s)
         db.commit()
         j = queue.claim_next(db, "w1")
-        queue.finish(db, j.id, "failed", "boom", retryable=True)
+        queue.finish(db, j.id, j.lease_token, "failed", "boom", retryable=True)
         assert db.get(Job, j.id).status == "queued"
         j = queue.claim_next(db, "w1")
-        queue.finish(db, j.id, "failed", "bad video", retryable=False)
+        queue.finish(db, j.id, j.lease_token, "failed", "bad video", retryable=False)
         assert db.get(Job, j.id).status == "failed"
+
+
+def test_stale_attempt_cannot_touch_reassigned_job(fresh_db):
+    """Review finding 3: the old worker's cancel/finish must not affect the new worker's attempt."""
+    with fresh_db.SessionLocal() as db:
+        s = _scan(db)
+        queue.enqueue(db, s)
+        db.commit()
+        first = queue.claim_next(db, "old-worker")
+        old_token = first.lease_token
+        first.lease_until = utcnow() - timedelta(seconds=1)  # old worker stalls; lease expires
+        db.commit()
+        second = queue.claim_next(db, "new-worker")
+        assert second.id == first.id and second.lease_token != old_token
+
+        # The stale worker now hits its error/cancel path and tries to write the outcome.
+        assert queue.finish(db, first.id, old_token, "cancelled", "stale", retryable=False) is False
+        assert queue.finish(db, first.id, old_token, "succeeded") is False
+        db.expire_all()
+        job = db.get(Job, first.id)
+        assert job.status == "running" and job.lease_token == second.lease_token
+
+        stale_ctx = queue.JobContext(fresh_db.SessionLocal, first.id, old_token)
+        import pytest as _pytest
+        with _pytest.raises(queue.StaleAttempt):
+            stale_ctx.update(0.5)
+        with _pytest.raises(queue.StaleAttempt):
+            stale_ctx.assert_owner(db)
+
+        # The current owner still completes normally.
+        assert queue.finish(db, second.id, second.lease_token, "succeeded") is True
+        assert db.get(Job, second.id).status == "succeeded"

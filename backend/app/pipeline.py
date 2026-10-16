@@ -4,6 +4,13 @@ The stages are streamed: frames are sampled → keyframes are selected → each
 keyframe is OCR'd and read immediately, so only one frame's pixels sit in memory
 at a time. Images are written to the private frame store and pruned afterwards
 so only keyframes referenced by evidence remain.
+
+Reprocessing is crash-safe. Each run is an *attempt* (identified by the job's lease token). Everything it writes
+is tagged with that attempt and hidden (groups.published = false) until a single publish transaction:
+  1. proves the attempt still owns the job (compare-and-set on the lease token),
+  2. carries confirm/reject decisions over from the currently published results, read at that moment,
+  3. deletes the previously published rows and makes the new ones visible.
+Old image files are removed only after that commit. If anything fails earlier, the previous results stay intact.
 """
 from __future__ import annotations
 
@@ -35,6 +42,15 @@ def frame_dir_for(scan_id: int) -> Path:
     return settings.frame_dir / str(scan_id)
 
 
+def attempt_dir_for(scan_id: int, attempt_id: str) -> Path:
+    return frame_dir_for(scan_id) / attempt_id
+
+
+def _not_current(column, current: Optional[str]):
+    """SQL condition: rows that don't belong to the published attempt."""
+    return column.isnot(None) if current is None else ((column.is_(None)) | (column != current))
+
+
 def process_scan(ctx: JobContext, scan_id: int) -> None:
     gd = get_gamedata()
     with dbmod.SessionLocal() as db:
@@ -60,20 +76,15 @@ def process_scan(ctx: JobContext, scan_id: int) -> None:
         scan.duration_s, scan.width, scan.height = info.duration_s, info.width, info.height
         db.commit()
 
-    # Snapshot confirmed links so reprocessing the same recording is idempotent.
-    prior_links: Dict[str, Tuple[str, str]] = {}
+    aid = ctx.attempt_id
+    # Remove leftovers of crashed or abandoned attempts. Published results are never touched here.
     with dbmod.SessionLocal() as db:
-        for g in db.scalars(select(ObservationGroup).where(ObservationGroup.scan_id == scan_id)).all():
-            if g.pokemon_id and g.status == "confirmed":
-                prior_links[g.track_key] = (g.pokemon_id, g.status)
-            elif g.status == "rejected":
-                prior_links[g.track_key] = ("", "rejected")
-        _clear_scan_results(db, scan_id)
+        current = db.get(Scan, scan_id).current_attempt_id
+        leftover_paths = _delete_rows(db, scan_id, _not_current_filter(current))
         db.commit()
-
-    fdir = frame_dir_for(scan_id)
-    if fdir.exists():
-        shutil.rmtree(fdir)
+    _remove_files(leftover_paths)
+    fdir = attempt_dir_for(scan_id, aid)
+    shutil.rmtree(fdir, ignore_errors=True)
     fdir.mkdir(parents=True, exist_ok=True)
 
     engine = get_engine()
@@ -128,14 +139,15 @@ def process_scan(ctx: JobContext, scan_id: int) -> None:
         with dbmod.SessionLocal() as db:
             fr = Frame(scan_id=scan_id, idx=kf.index, timestamp_ms=kf.timestamp_ms, screen_type=screen, segment=kf.segment,
                        scroll_offset=kf.scroll_offset, width=w, height=h, image_path=str(img_path),
-                       ocr=[t.to_json() for t in tokens])
+                       ocr=[t.to_json() for t in tokens], attempt_id=aid)
             db.add(fr)
             db.flush()
             for r in raws:
                 attrs = {k: a.to_json(fr.id) for k, a in r.attrs.items()}
                 content_y = (r.frame_y + kf.scroll_offset) if r.frame_y is not None else None
                 ob = Observation(scan_id=scan_id, frame_id=fr.id, screen_type=r.screen_type, segment=kf.segment,
-                                 grid_col=r.grid_col, content_y=content_y, bbox=list(r.bbox), attributes=attrs)
+                                 grid_col=r.grid_col, content_y=content_y, bbox=list(r.bbox), attributes=attrs,
+                                 attempt_id=aid)
                 db.add(ob)
                 db.flush()
                 notes = list(r.notes)
@@ -151,9 +163,10 @@ def process_scan(ctx: JobContext, scan_id: int) -> None:
     ctx.update(0.9, "grouping observations")
     drafts = group_observations(lite)
 
+    # Stage the groups (invisible until published).
     with dbmod.SessionLocal() as db:
-        obs_by_id = {o.id: o for o in db.scalars(select(Observation).where(Observation.scan_id == scan_id)).all()}
-        key_to_group: Dict[str, ObservationGroup] = {}
+        obs_by_id = {o.id: o for o in db.scalars(select(Observation).where(Observation.scan_id == scan_id,
+                                                                           Observation.attempt_id == aid)).all()}
         for d in drafts:
             attrs = sanitize_group_attributes(dict(d.attributes), gd)
             reasons = [r for r in d.reasons if not (r.startswith("Conflicting nickname") and "nickname" not in attrs)]
@@ -161,64 +174,92 @@ def process_scan(ctx: JobContext, scan_id: int) -> None:
             best_ob = obs_by_id[best.key]
             g = ObservationGroup(scan_id=scan_id, track_key=d.track_key, attributes=attrs, review_reasons=reasons,
                                  observation_count=len(d.obs), first_ts_ms=min(o.ts_ms for o in d.obs),
-                                 last_ts_ms=max(o.ts_ms for o in d.obs), best_frame_id=best_ob.frame_id, best_bbox=best_ob.bbox)
+                                 last_ts_ms=max(o.ts_ms for o in d.obs), best_frame_id=best_ob.frame_id,
+                                 best_bbox=best_ob.bbox, attempt_id=aid, published=False)
             db.add(g)
             db.flush()
-            key_to_group[d.track_key] = g
             for o in d.obs:
                 obs_by_id[o.key].group_id = g.id
-            # Appraisal readings for this individual.
             readings = [(appraisal_readings[o.key], o) for o in d.obs if o.key in appraisal_readings]
             if readings:
-                _apply_appraisal(db, g, readings, gd)
+                _apply_appraisal(db, g, readings, gd, aid)
+        db.commit()
 
-        for d in drafts:
-            g = key_to_group[d.track_key]
-            prior = prior_links.get(d.track_key)
+    ctx.update(0.95, "publishing results")
+    stats.update({"ocr_engine": engine.name, "gamedata": gd.timestamp})
+    old_paths = publish_attempt(ctx, scan_id, stats)
+    _remove_files(old_paths)
+    _remove_stale_attempt_dirs(scan_id, keep=aid)
+    discard_scan_media(scan_id, keep_video_if_requested=True, frames_too=False)
+
+
+def publish_attempt(ctx: JobContext, scan_id: int, stats: dict) -> List[str]:
+    """Atomically replace the scan's published results with this attempt's staged results.
+
+    Returns image paths of the replaced attempt, to delete only after the commit succeeded.
+    """
+    aid = ctx.attempt_id
+    with dbmod.SessionLocal() as db:
+        ctx.assert_owner(db)  # takes the write lock; a stale attempt stops here and writes nothing
+        scan = db.get(Scan, scan_id)
+        staged = db.scalars(select(ObservationGroup).where(ObservationGroup.scan_id == scan_id,
+                                                          ObservationGroup.attempt_id == aid)).all()
+
+        # Decisions on the currently published results, read now, so a confirm/reject made while this
+        # attempt was processing is carried over too.
+        decisions: Dict[str, Tuple[Optional[str], str]] = {}
+        for g in db.scalars(select(ObservationGroup).where(ObservationGroup.scan_id == scan_id,
+                                                          ObservationGroup.published.is_(True))).all():
+            if g.status == "confirmed" and g.pokemon_id:
+                decisions[g.track_key] = (g.pokemon_id, "confirmed")
+            elif g.status == "rejected":
+                decisions[g.track_key] = (None, "rejected")
+
+        for g in staged:
+            prior = decisions.get(g.track_key)
             if prior and prior[1] == "confirmed" and db.get(Pokemon, prior[0]) is not None:
-                g.pokemon_id, g.status = prior[0], "confirmed"
-                g.review_reasons = []
-                g.link_method = "reimport"
-                db.add(PokemonEvidence(pokemon_id=prior[0], group_id=g.id, scan_id=scan_id, frame_id=g.best_frame_id, kind="reimport"))
-                continue
-            if prior and prior[1] == "rejected":
+                g.pokemon_id, g.status, g.review_reasons, g.link_method = prior[0], "confirmed", [], "reimport"
+                db.add(PokemonEvidence(pokemon_id=prior[0], group_id=g.id, scan_id=scan_id, frame_id=g.best_frame_id,
+                                       kind="reimport"))
+            elif prior and prior[1] == "rejected":
                 g.status = "rejected"
-                continue
-            refresh_candidates(db, g)
-            g.status = decide_status(g)
-
+            else:
+                refresh_candidates(db, g)
+                g.status = decide_status(g)
         db.flush()
+
+        auto_confirmed = auto_linked = 0
         auto = db.get(AppSetting, "auto_confirm_ready")
-        auto_confirmed = 0
-        auto_linked = 0
         if auto is not None and auto.value:
             # Re-sightings first, so a confident new item can't be mistaken for an existing one.
-            auto_linked = len(auto_link_resightings(db, scan_id))
-            # Only "ready" groups: high confidence on species and CP, no review reasons, no identity candidates.
-            auto_confirmed = len(bulk_confirm_ready(db, scan_id, via="auto"))
+            auto_linked = len(auto_link_resightings(db, scan_id, attempt_id=aid))
+            auto_confirmed = len(bulk_confirm_ready(db, scan_id, via="auto", attempt_id=aid))
 
-        _prune_unreferenced_frames(db, scan_id)
-        scan = db.get(Scan, scan_id)
-        db.flush()
-        pending = sum(1 for g in key_to_group.values() if g.status in ("needs_review", "ready"))
-        stats.update({"groups": len(drafts), "pending": pending,
-                      "needs_review": sum(1 for g in key_to_group.values() if g.status == "needs_review"),
-                      "relinked": sum(1 for g in key_to_group.values() if g.link_method == "reimport"),
-                      "auto_confirmed": auto_confirmed, "auto_linked": auto_linked,
-                      "ocr_engine": engine.name, "gamedata": gd.timestamp})
-        if stats["observations"] == 0:
+        # Swap: drop the previous published rows, reveal the staged ones.
+        old_paths = _delete_rows(db, scan_id, _not_current_filter(aid))
+        for g in staged:
+            g.published = True
+        scan.current_attempt_id = aid
+        pruned = _prune_unreferenced_frames(db, scan_id, aid)
+
+        pending = sum(1 for g in staged if g.status in ("needs_review", "ready"))
+        stats.update({"groups": len(staged), "pending": pending,
+                      "needs_review": sum(1 for g in staged if g.status == "needs_review"),
+                      "relinked": sum(1 for g in staged if g.link_method == "reimport"),
+                      "auto_confirmed": auto_confirmed, "auto_linked": auto_linked})
+        if stats.get("observations", 0) == 0:
             stats["message"] = ("No Pokémon storage, detail or appraisal screens were recognised. "
                                 "Record the Pokémon storage grid or detail pages with the iPhone screen recorder.")
         scan.summary = stats
         scan.status = "review" if pending else "done"
-        scan.frames_retained = db.query(Frame).filter(Frame.scan_id == scan_id).count()
+        scan.error = None
+        scan.frames_retained = db.query(Frame).filter(Frame.scan_id == scan_id, Frame.attempt_id == aid,
+                                                       Frame.image_path.isnot(None)).count()
         db.commit()
-
-    ctx.update(0.98, "cleaning up")
-    discard_scan_media(scan_id, keep_video_if_requested=True, frames_too=False)
+    return old_paths + pruned
 
 
-def _apply_appraisal(db, g: ObservationGroup, readings, gd) -> None:
+def _apply_appraisal(db, g: ObservationGroup, readings, gd, attempt_id: Optional[str] = None) -> None:
     from .appraisal.bars import BarReading
 
     def strength(r):
@@ -255,7 +296,8 @@ def _apply_appraisal(db, g: ObservationGroup, readings, gd) -> None:
             g.review_reasons = [r for r in (g.review_reasons or []) if not r.startswith(("Form could not", "CP/HP are not"))]
 
     db.add(Appraisal(scan_id=g.scan_id, frame_id=best["frame_id"], group_id=g.id, bars=best["bars"], stars=stars,
-                     iv_candidates=[list(c) for c in cands[:200]], status=status, confidence=conf))
+                     iv_candidates=[list(c) for c in cands[:200]], status=status, confidence=conf,
+                     attempt_id=attempt_id))
     if stars is not None:
         attrs["stars"] = {"value": stars, "confidence": 0.9, "method": "appraisal:badge", "frame_id": best["frame_id"]}
     if status == "verified":
@@ -269,25 +311,76 @@ def _apply_appraisal(db, g: ObservationGroup, readings, gd) -> None:
     g.attributes = attrs
 
 
-def _clear_scan_results(db, scan_id: int) -> None:
-    db.execute(delete(Appraisal).where(Appraisal.scan_id == scan_id))
-    db.execute(delete(Observation).where(Observation.scan_id == scan_id))
-    group_ids = select(ObservationGroup.id).where(ObservationGroup.scan_id == scan_id)
+def _not_current_filter(current: Optional[str]):
+    return lambda model: _not_current(model.attempt_id, current)
+
+
+def _only_attempt_filter(attempt_id: str):
+    return lambda model: model.attempt_id == attempt_id
+
+
+def _delete_rows(db, scan_id: int, where) -> List[str]:
+    """Delete one or more attempts' rows (selected by `where(model)`). Returns their image paths."""
+    paths = [p for (p,) in db.execute(select(Frame.image_path).where(Frame.scan_id == scan_id, where(Frame))) if p]
+    group_ids = select(ObservationGroup.id).where(ObservationGroup.scan_id == scan_id, where(ObservationGroup))
+    db.execute(delete(Appraisal).where(Appraisal.scan_id == scan_id, where(Appraisal)))
+    db.execute(delete(Observation).where(Observation.scan_id == scan_id, where(Observation)))
     db.execute(delete(PokemonEvidence).where(PokemonEvidence.group_id.in_(group_ids)))
-    db.execute(delete(ObservationGroup).where(ObservationGroup.scan_id == scan_id))
-    db.execute(delete(Frame).where(Frame.scan_id == scan_id))
+    db.execute(delete(ObservationGroup).where(ObservationGroup.scan_id == scan_id, where(ObservationGroup)))
+    db.execute(delete(Frame).where(Frame.scan_id == scan_id, where(Frame)))
+    return paths
 
 
-def _prune_unreferenced_frames(db, scan_id: int) -> None:
-    """Keep only frames that some group uses as its best evidence or that hold appraisal readings."""
-    keep = {fid for (fid,) in db.execute(select(ObservationGroup.best_frame_id).where(ObservationGroup.scan_id == scan_id)) if fid}
-    keep |= {fid for (fid,) in db.execute(select(Appraisal.frame_id).where(Appraisal.scan_id == scan_id)) if fid}
-    for fr in db.scalars(select(Frame).where(Frame.scan_id == scan_id)).all():
+def _remove_files(paths: List[str]) -> None:
+    for p in paths:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+
+def _remove_stale_attempt_dirs(scan_id: int, keep: str) -> None:
+    root = frame_dir_for(scan_id)
+    if not root.exists():
+        return
+    for child in root.iterdir():
+        if child.is_dir() and child.name != keep:
+            shutil.rmtree(child, ignore_errors=True)
+        elif child.is_file():  # images from before per-attempt folders
+            child.unlink(missing_ok=True)
+
+
+def _prune_unreferenced_frames(db, scan_id: int, attempt_id: str) -> List[str]:
+    """Keep only this attempt's frames used as best evidence or holding appraisal readings.
+
+    Returns image paths to delete after commit.
+    """
+    keep = {fid for (fid,) in db.execute(select(ObservationGroup.best_frame_id).where(
+        ObservationGroup.scan_id == scan_id, ObservationGroup.attempt_id == attempt_id)) if fid}
+    keep |= {fid for (fid,) in db.execute(select(Appraisal.frame_id).where(
+        Appraisal.scan_id == scan_id, Appraisal.attempt_id == attempt_id)) if fid}
+    paths = []
+    for fr in db.scalars(select(Frame).where(Frame.scan_id == scan_id, Frame.attempt_id == attempt_id)).all():
         if fr.id not in keep:
-            if fr.image_path and os.path.exists(fr.image_path):
-                os.remove(fr.image_path)
+            if fr.image_path:
+                paths.append(fr.image_path)
             fr.image_path = None
             fr.ocr = []  # drop text of frames nobody references (may include nicknames)
+    return paths
+
+
+def discard_attempt(scan_id: int, attempt_id: Optional[str]) -> None:
+    """Throw away an unpublished attempt (failed, cancelled or stale). Never touches published results."""
+    if not attempt_id:
+        return
+    with dbmod.SessionLocal() as db:
+        scan = db.get(Scan, scan_id)
+        if scan is None or scan.current_attempt_id == attempt_id:
+            return
+        paths = _delete_rows(db, scan_id, _only_attempt_filter(attempt_id))
+        db.commit()
+    _remove_files(paths)
+    shutil.rmtree(attempt_dir_for(scan_id, attempt_id), ignore_errors=True)
 
 
 def discard_scan_media(scan_id: int, keep_video_if_requested: bool = True, frames_too: bool = False) -> None:

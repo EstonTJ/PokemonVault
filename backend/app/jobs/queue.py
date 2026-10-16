@@ -7,6 +7,7 @@ is re-queued, up to `max_attempts`. Cancellation is cooperative: the API sets
 """
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 from typing import Optional
 
@@ -34,6 +35,7 @@ def recover_expired(db: Session) -> int:
     now = utcnow()
     stale = db.scalars(select(Job).where(Job.status == "running", Job.lease_until < now)).all()
     for job in stale:
+        job.lease_token = None
         if job.cancel_requested:
             job.status, job.finished_at = "cancelled", now
             _set_scan_status(db, job.scan_id, "cancelled")
@@ -42,7 +44,7 @@ def recover_expired(db: Session) -> int:
             job.error = (job.error or "") + "\nWorker stopped responding; attempts exhausted."
             _set_scan_status(db, job.scan_id, "failed", job.error)
         else:
-            job.status, job.worker_id, job.lease_until = "queued", None, None
+            job.status, job.worker_id, job.lease_until, job.lease_token = "queued", None, None, None
             job.stage = "requeued after worker loss"
     db.commit()
     return len(stale)
@@ -65,6 +67,7 @@ def claim_next(db: Session, worker_id: str) -> Optional[Job]:
         .values(
             status="running",
             worker_id=worker_id,
+            lease_token=str(uuid.uuid4()),
             attempts=Job.attempts + 1,
             lease_until=now + timedelta(seconds=settings.job_lease_s),
             started_at=now,
@@ -78,23 +81,41 @@ def claim_next(db: Session, worker_id: str) -> Optional[Job]:
     return db.get(Job, candidate.id)
 
 
-class JobContext:
-    """Handed to the pipeline: reports progress, renews the lease, checks for cancellation."""
+class StaleAttempt(Exception):
+    """This worker no longer holds the job's lease; its results must not be written."""
 
-    def __init__(self, session_factory, job_id: int, worker_id: str):
+
+def _owned(db: Session, job_id: int, lease_token: str) -> Optional[Job]:
+    job = db.get(Job, job_id)
+    if job is None or job.lease_token != lease_token or job.status != "running":
+        return None
+    return job
+
+
+class JobContext:
+    """Handed to the pipeline: reports progress, renews the lease, checks for cancellation.
+
+    Identifies the attempt by its lease token, not by worker id or job id.
+    """
+
+    def __init__(self, session_factory, job_id: int, lease_token: str):
         self._sf = session_factory
         self.job_id = job_id
-        self.worker_id = worker_id
+        self.lease_token = lease_token
+
+    @property
+    def attempt_id(self) -> str:
+        return self.lease_token
 
     def update(self, progress: Optional[float] = None, stage: Optional[str] = None) -> None:
         with self._sf() as db:
             job = db.get(Job, self.job_id)
             if job is None:
                 raise JobCancelled("job deleted")
+            if job.lease_token != self.lease_token or job.status != "running":
+                raise StaleAttempt("lease lost to another attempt")
             if job.cancel_requested:
                 raise JobCancelled("cancel requested")
-            if job.worker_id != self.worker_id:
-                raise JobCancelled("lease lost to another worker")
             if progress is not None:
                 job.progress = max(0.0, min(1.0, progress))
             if stage is not None:
@@ -104,19 +125,43 @@ class JobContext:
 
     check = update
 
+    def assert_owner(self, db: Session) -> Job:
+        """Call first inside the transaction that publishes results.
+
+        A compare-and-set on the lease token both proves ownership and takes the database write lock, so no
+        other attempt can claim the job between this check and the commit.
+        """
+        res = db.execute(
+            update(Job)
+            .where(Job.id == self.job_id, Job.lease_token == self.lease_token, Job.status == "running")
+            .values(lease_until=utcnow() + timedelta(seconds=settings.job_lease_s))
+        )
+        if res.rowcount != 1:
+            db.rollback()
+            raise StaleAttempt("lease lost before publishing")
+        job = db.get(Job, self.job_id)
+        if job.cancel_requested:
+            db.rollback()
+            raise JobCancelled("cancel requested")
+        return job
+
 
 class PermanentJobError(Exception):
     """A failure that retrying will not fix (bad video, limits exceeded)."""
 
 
-def finish(db: Session, job_id: int, status: str, error: Optional[str] = None, retryable: bool = True) -> None:
-    job = db.get(Job, job_id)
+def finish(db: Session, job_id: int, lease_token: str, status: str, error: Optional[str] = None,
+           retryable: bool = True) -> bool:
+    """Record the outcome of an attempt. A no-op (returns False) unless `lease_token` still owns the job."""
+    job = _owned(db, job_id, lease_token)
     if job is None:
-        return
+        db.rollback()
+        return False
     job.status = status
     job.error = error
     job.finished_at = utcnow()
     job.lease_until = None
+    job.lease_token = None
     if status == "succeeded":
         job.progress = 1.0
         job.stage = "done"
@@ -129,6 +174,7 @@ def finish(db: Session, job_id: int, status: str, error: Optional[str] = None, r
     if job.status in ("failed", "cancelled"):
         _set_scan_status(db, job.scan_id, job.status, error)
     db.commit()
+    return True
 
 
 def request_cancel(db: Session, job: Job) -> None:

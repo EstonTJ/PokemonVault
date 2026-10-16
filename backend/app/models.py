@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -25,6 +25,11 @@ def new_uuid() -> str:
 
 class Scan(Base):
     __tablename__ = "scans"
+    __table_args__ = (
+        # One canonical scan per recording (demo fixtures share a placeholder hash and are exempt).
+        Index("uq_scans_sha256_real", "sha256", unique=True,
+              sqlite_where=text("is_demo = 0"), postgresql_where=text("is_demo = false")),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -43,6 +48,8 @@ class Scan(Base):
     is_demo: Mapped[bool] = mapped_column(Boolean, default=False)
     summary: Mapped[dict] = mapped_column(JSON, default=dict)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The processing attempt whose results are visible. NULL = results written before attempts existed.
+    current_attempt_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
     jobs: Mapped[list["Job"]] = relationship(back_populates="scan", cascade="all, delete-orphan")
     frames: Mapped[list["Frame"]] = relationship(back_populates="scan", cascade="all, delete-orphan")
@@ -51,6 +58,11 @@ class Scan(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (
+        Index("uq_jobs_one_active_per_scan", "scan_id", unique=True,
+              sqlite_where=text("status IN ('queued', 'running')"),
+              postgresql_where=text("status IN ('queued', 'running')")),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     scan_id: Mapped[int] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
@@ -63,6 +75,9 @@ class Job(Base):
     max_attempts: Mapped[int] = mapped_column(Integer, default=2)
     lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     worker_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # New random token on every claim. Only the holder of the current token may report progress, publish
+    # results or finish the job, so a worker whose lease was reassigned can't overwrite the new attempt.
+    lease_token: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -85,13 +100,14 @@ class Frame(Base):
     height: Mapped[int] = mapped_column(Integer)
     image_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     ocr: Mapped[list] = mapped_column(JSON, default=list)
+    attempt_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
 
     scan: Mapped[Scan] = relationship(back_populates="frames")
 
 
 class ObservationGroup(Base):
     __tablename__ = "observation_groups"
-    __table_args__ = (UniqueConstraint("scan_id", "track_key", name="uq_group_track"),)
+    __table_args__ = (UniqueConstraint("scan_id", "attempt_id", "track_key", name="uq_group_attempt_track"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     scan_id: Mapped[int] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
@@ -108,6 +124,9 @@ class ObservationGroup(Base):
     best_bbox: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     # How the group was resolved: review | bulk | auto | auto-link | reimport
     link_method: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    attempt_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    # Staged results of an in-progress attempt are invisible until the attempt is published.
+    published: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
 
     scan: Mapped[Scan] = relationship(back_populates="groups")
     observations: Mapped[list["Observation"]] = relationship(back_populates="group")
@@ -127,12 +146,27 @@ class Observation(Base):
     content_y: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     bbox: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)
+    attempt_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
 
     group: Mapped[Optional[ObservationGroup]] = relationship(back_populates="observations")
 
 
 class Pokemon(Base):
     __tablename__ = "pokemon"
+    # Basic invariants enforced by the database, whatever code path writes the row.
+    __table_args__ = (
+        CheckConstraint("cp IS NULL OR (cp BETWEEN 10 AND 6000)", name="ck_pokemon_cp"),
+        CheckConstraint("hp IS NULL OR (hp BETWEEN 10 AND 1000)", name="ck_pokemon_hp"),
+        CheckConstraint("iv_atk IS NULL OR (iv_atk BETWEEN 0 AND 15)", name="ck_pokemon_iv_atk"),
+        CheckConstraint("iv_def IS NULL OR (iv_def BETWEEN 0 AND 15)", name="ck_pokemon_iv_def"),
+        CheckConstraint("iv_sta IS NULL OR (iv_sta BETWEEN 0 AND 15)", name="ck_pokemon_iv_sta"),
+        CheckConstraint("iv_status IN ('unknown', 'range', 'verified')", name="ck_pokemon_iv_status"),
+        CheckConstraint("iv_status != 'verified' OR (iv_atk IS NOT NULL AND iv_def IS NOT NULL AND iv_sta IS NOT NULL)",
+                        name="ck_pokemon_verified_ivs_present"),
+        CheckConstraint("level IS NULL OR (level BETWEEN 1 AND 51)", name="ck_pokemon_level"),
+        CheckConstraint("weight_kg IS NULL OR weight_kg > 0", name="ck_pokemon_weight"),
+        CheckConstraint("height_m IS NULL OR height_m > 0", name="ck_pokemon_height"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     species_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -196,6 +230,7 @@ class Appraisal(Base):
     iv_candidates: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(16), default="ambiguous")  # verified|ambiguous|failed
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    attempt_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

@@ -9,7 +9,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..auth import Owner
-from ..catalog.importer import EDITABLE_FIELDS
+from ..validation import InvalidInput, check_pokemon_invariants, clean_pokemon_input
 from ..db import get_db
 from ..export.exporters import collection_csv, collection_json
 from ..models import AppSetting, Correction, ObservationGroup, Pokemon, PokemonEvidence, Scan
@@ -93,34 +93,41 @@ def get_pokemon(pid: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/pokemon/{pid}")
-def edit_pokemon(pid: str, edits: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+def edit_pokemon(pid: str, edits: Any = Body(...), db: Session = Depends(get_db)):
     p = db.get(Pokemon, pid) or _404()
+    try:
+        cleaned = clean_pokemon_input(edits)
+        merged = {f: getattr(p, f) for f in INVARIANT_FIELDS}
+        merged.update(cleaned)
+        merged["iv_status"] = _iv_status_after(merged, p)
+        check_pokemon_invariants(merged)
+    except InvalidInput as exc:
+        raise HTTPException(400, str(exc))
     gd = get_gamedata()
     prov = dict(p.provenance or {})
-    for f, v in edits.items():
-        if f not in EDITABLE_FIELDS:
-            raise HTTPException(400, f"Field {f!r} is not editable.")
-        if f in ("iv_atk", "iv_def", "iv_sta") and v is not None and not (0 <= int(v) <= 15):
-            raise HTTPException(400, "IVs must be 0-15.")
-        if f == "cp" and v is not None and not (10 <= int(v) <= 6000):
-            raise HTTPException(400, "CP out of range.")
+    for f, v in cleaned.items():
         old = getattr(p, f)
         if f == "species_id":
             sp = gd.get(v)
-            if sp is None:
-                raise HTTPException(400, "Unknown species.")
             p.dex, p.form = sp.dex, sp.form
         if old != v:
             db.add(Correction(target="pokemon", target_id=pid, field=f, old=old, new=v))
             setattr(p, f, v)
             if f != "notes":
                 prov[f] = {"confidence": 1.0, "method": "user"}
-    if any(f in edits for f in ("iv_atk", "iv_def", "iv_sta")):
-        have = all(getattr(p, f) is not None for f in ("iv_atk", "iv_def", "iv_sta"))
-        p.iv_status = "verified" if have else ("range" if p.iv_candidates else "unknown")
+    p.iv_status = merged["iv_status"]
     p.provenance = prov
     db.commit()
     return pokemon_json(p)
+
+
+INVARIANT_FIELDS = ("cp", "hp", "iv_atk", "iv_def", "iv_sta", "shadow", "purified", "iv_status")
+
+
+def _iv_status_after(values: Dict[str, Any], p: Optional[Pokemon]) -> str:
+    if all(values.get(f) is not None for f in ("iv_atk", "iv_def", "iv_sta")):
+        return "verified"
+    return "range" if (p is not None and p.iv_candidates) else "unknown"
 
 
 @router.post("/pokemon/{pid}/mark-checked")
@@ -135,17 +142,20 @@ def mark_checked(pid: str, db: Session = Depends(get_db)):
 
 
 @router.post("/pokemon", status_code=201)
-def add_manual(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
-    sp = get_gamedata().get(body.get("species_id"))
-    if sp is None:
-        raise HTTPException(400, "Unknown species.")
-    p = Pokemon(species_id=sp.species_id, dex=sp.dex, form=sp.form, user_confirmed=True, confirmed_via="manual", confidence=1.0)
-    for f in EDITABLE_FIELDS:
-        if f in body and f != "species_id":
-            setattr(p, f, body[f])
-    if all(getattr(p, f) is not None for f in ("iv_atk", "iv_def", "iv_sta")):
-        p.iv_status = "verified"
-    p.provenance = {f: {"confidence": 1.0, "method": "user"} for f in body}
+def add_manual(body: Any = Body(...), db: Session = Depends(get_db)):
+    try:
+        cleaned = clean_pokemon_input(body, require_species=True)
+        cleaned_with_status = {**cleaned, "iv_status": _iv_status_after(cleaned, None)}
+        check_pokemon_invariants(cleaned_with_status)
+    except InvalidInput as exc:
+        raise HTTPException(400, str(exc))
+    sp = get_gamedata().get(cleaned["species_id"])
+    p = Pokemon(species_id=sp.species_id, dex=sp.dex, form=sp.form, user_confirmed=True, confirmed_via="manual",
+                confidence=1.0, iv_status=cleaned_with_status["iv_status"])
+    for f, v in cleaned.items():
+        if f != "species_id":
+            setattr(p, f, v)
+    p.provenance = {f: {"confidence": 1.0, "method": "user"} for f in cleaned if f != "notes"}
     db.add(p)
     db.commit()
     return pokemon_json(p)
@@ -210,7 +220,8 @@ def dashboard(include_demo: bool = True, db: Session = Depends(get_db)):
         stmt = stmt.where(Pokemon.is_demo.is_(False))
     pokes = db.scalars(stmt).all()
     js = [pokemon_json(p) for p in pokes]
-    pending = db.scalars(select(ObservationGroup).where(ObservationGroup.status.in_(("needs_review", "ready")))).all()
+    pending = db.scalars(select(ObservationGroup).where(ObservationGroup.status.in_(("needs_review", "ready")),
+                                                        ObservationGroup.published.is_(True))).all()
     dup_groups = [g for g in pending if g.candidate_pokemon_ids or any("duplicate" in r.lower() for r in (g.review_reasons or []))]
     recs = _all_recs(db, include_demo)
     evolve = [{"pokemon": pokemon_json(p), "reasons": a["reasons"]} for p, r in recs for a in r["actions"] if a["action"] == "Evolve"]

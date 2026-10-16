@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..models import Correction, ObservationGroup, Pokemon, PokemonEvidence, utcnow
 from ..recommend.gamedata import get_gamedata
+from ..validation import check_pokemon_invariants, clean_pokemon_input
 from .identity import find_candidates
 
 EDITABLE_FIELDS = ("species_id", "form", "nickname", "cp", "hp", "shiny", "shadow", "purified", "lucky", "favorite",
@@ -58,17 +59,16 @@ def _log(db: Session, target: str, target_id: str, field: str, old, new) -> None
 def apply_group_edits(db: Session, g: ObservationGroup, edits: Dict[str, Any]) -> None:
     """User corrections on a pending group. Edited values get confidence 1.0 and method 'user'."""
     gd = get_gamedata()
+    cleaned = clean_pokemon_input(edits)  # same rules as every other write path; raises InvalidInput
     attrs = dict(g.attributes or {})
-    for f, v in edits.items():
-        if f not in EDITABLE_FIELDS or f == "notes":
+    for f, v in cleaned.items():
+        if f == "notes":
             continue
         old = _attr_value(attrs, f)
         _log(db, "group", str(g.id), f, old, v)
         attrs[f] = {"value": v, "confidence": 1.0, "method": "user", "frame_id": None}
         if f == "species_id" and v:
             sp = gd.get(v)
-            if sp is None:
-                raise ValueError(f"Unknown species_id {v!r}")
             attrs["dex"] = {"value": sp.dex, "confidence": 1.0, "method": "user", "frame_id": None}
             attrs["form"] = {"value": sp.form, "confidence": 1.0, "method": "user", "frame_id": None}
     g.attributes = attrs
@@ -136,6 +136,11 @@ def confirm_group(db: Session, g: ObservationGroup, link_to: Optional[str] = Non
     confs = [attrs[f]["confidence"] for f in KEY_FIELDS if attrs.get(f)]
     p.confidence = round(min(confs) if confs else 0.0, 3)
     p.provenance = provenance
+    if p.iv_status == "verified" and any(getattr(p, f) is None for f in ("iv_atk", "iv_def", "iv_sta")):
+        p.iv_status = "range" if p.iv_candidates else "unknown"
+    # Final state must satisfy the same invariants as manual edits (scanner output included).
+    check_pokemon_invariants({f: getattr(p, f) for f in ("cp", "hp", "iv_atk", "iv_def", "iv_sta", "shadow",
+                                                         "purified", "iv_status")})
     # "auto" means the scanner was confident and the owner opted in; it is not a human check.
     # Never downgrade a Pokémon the owner already checked.
     automatic = via in AUTOMATIC
@@ -158,10 +163,16 @@ def reject_group(db: Session, g: ObservationGroup) -> None:
     g.status = "rejected"
 
 
-def bulk_confirm_ready(db: Session, scan_id: int, via: str = "bulk") -> List[str]:
-    groups = db.scalars(select(ObservationGroup).where(ObservationGroup.scan_id == scan_id, ObservationGroup.status == "ready")).all()
-    return [confirm_group(db, g, via=via).id for g in groups]
+def _scope(stmt, attempt_id: Optional[str]):
+    """Staged results of one attempt, or (default) the published results the user sees."""
+    if attempt_id is not None:
+        return stmt.where(ObservationGroup.attempt_id == attempt_id)
+    return stmt.where(ObservationGroup.published.is_(True))
 
+
+def bulk_confirm_ready(db: Session, scan_id: int, via: str = "bulk", attempt_id: Optional[str] = None) -> List[str]:
+    stmt = select(ObservationGroup).where(ObservationGroup.scan_id == scan_id, ObservationGroup.status == "ready")
+    return [confirm_group(db, g, via=via).id for g in db.scalars(_scope(stmt, attempt_id)).all()]
 
 def _strong_value(attrs: Dict[str, dict], f: str, min_conf: float):
     a = attrs.get(f)
@@ -170,25 +181,45 @@ def _strong_value(attrs: Dict[str, dict], f: str, min_conf: float):
     return a["value"]
 
 
-def auto_link_resightings(db: Session, scan_id: int) -> List[str]:
-    """Link re-scanned Pokémon to existing ones, but only when the match is unambiguous.
+def _positive_evidence(attrs: Dict[str, dict], p: Pokemon) -> List[str]:
+    """Matches beyond species+CP that point to the SAME individual. Both sides must actually have the value."""
+    found: List[str] = []
+    hp = _strong_value(attrs, "hp", 0.5)
+    if hp is not None and p.hp is not None and hp == p.hp:
+        found.append("HP")
+    nick = _strong_value(attrs, "nickname", 0.5)
+    if nick and p.nickname and nick.strip().lower() == p.nickname.strip().lower():
+        found.append("nickname")
+    w, h = _strong_value(attrs, "weight_kg", 0.5), _strong_value(attrs, "height_m", 0.5)
+    if None not in (w, h, p.weight_kg, p.height_m) and abs(w - p.weight_kg) <= 0.005 and abs(h - p.height_m) <= 0.005:
+        found.append("weight+height")
+    ivs = _strong_value(attrs, "ivs", 0.5)
+    if ivs is not None and p.iv_status == "verified" and list(ivs) == [p.iv_atk, p.iv_def, p.iv_sta]:
+        found.append("IVs")
+    return found
+
+
+def auto_link_resightings(db: Session, scan_id: int, attempt_id: Optional[str] = None) -> List[str]:
+    """Link re-scanned Pokémon to existing ones, but only when the match is unambiguous AND corroborated.
 
     All of these must hold (anything else stays in Review):
       * the group's only open question is the identity match (no other review reasons);
       * species/form and CP were read with high confidence, and the form is not in doubt;
-      * exactly ONE existing Pokémon is compatible (identity.compare already rejects HP/flag/IV conflicts);
+      * exactly ONE existing Pokémon is compatible (identity.compare already rejects any conflicting field);
       * nicknames are identical, or both have none;
-      * HP matches whenever both sides know it;
+      * at least one POSITIVE match beyond species and CP: HP, custom nickname, weight+height, or verified IVs.
+        Missing data is never treated as agreement;
       * no other group in this scan points at the same Pokémon.
     """
-    groups = db.scalars(select(ObservationGroup).where(ObservationGroup.scan_id == scan_id,
-                                                       ObservationGroup.status == "needs_review")).all()
+    groups = db.scalars(_scope(select(ObservationGroup).where(ObservationGroup.scan_id == scan_id,
+                                                              ObservationGroup.status == "needs_review"),
+                               attempt_id)).all()
     claims: Dict[str, int] = {}
     for g in groups:
         for c in g.candidate_pokemon_ids or []:
             claims[c["pokemon_id"]] = claims.get(c["pokemon_id"], 0) + 1
-    already = {pid for (pid,) in db.execute(select(ObservationGroup.pokemon_id).where(
-        ObservationGroup.scan_id == scan_id, ObservationGroup.pokemon_id.isnot(None)))}
+    already = {pid for (pid,) in db.execute(_scope(select(ObservationGroup.pokemon_id).where(
+        ObservationGroup.scan_id == scan_id, ObservationGroup.pokemon_id.isnot(None)), attempt_id))}
 
     linked: List[str] = []
     for g in groups:
@@ -218,6 +249,8 @@ def auto_link_resightings(db: Session, scan_id: int) -> List[str]:
         w = _strong_value(attrs, "weight_kg", 0.5)
         if w is not None and p.weight_kg is not None and abs(w - p.weight_kg) > 0.005:
             continue
+        if not _positive_evidence(attrs, p):
+            continue  # species + CP alone is never enough
         confirm_group(db, g, link_to=pid, via="auto-link")
         already.add(pid)
         linked.append(pid)

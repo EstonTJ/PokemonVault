@@ -105,7 +105,7 @@ def export_all(db: Session = Depends(get_db)):
         "note": "Contains all database records. Images and videos are not included.",
         "pokemon": [pokemon_record(p) for p in db.scalars(select(Pokemon)).all()],
         "scans": [scan_json(s) for s in db.scalars(select(Scan)).all()],
-        "observation_groups": [group_json(g) for g in db.scalars(select(ObservationGroup)).all()],
+        "observation_groups": [group_json(g) for g in db.scalars(select(ObservationGroup).where(ObservationGroup.published.is_(True))).all()],
         "appraisals": [{"id": a.id, "scan_id": a.scan_id, "group_id": a.group_id, "pokemon_id": a.pokemon_id, "bars": a.bars,
                         "status": a.status, "confidence": a.confidence, "iv_candidates": a.iv_candidates}
                        for a in db.scalars(select(Appraisal)).all()],

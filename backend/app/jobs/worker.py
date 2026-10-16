@@ -29,28 +29,44 @@ def run_one(worker_id: str) -> bool:
         job = queue.claim_next(db, worker_id)
         if job is None:
             return False
-        job_id, scan_id, job_type = job.id, job.scan_id, job.type
-    ctx = queue.JobContext(dbmod.SessionLocal, job_id, worker_id)
+        job_id, scan_id, job_type, token = job.id, job.scan_id, job.type, job.lease_token
+    ctx = queue.JobContext(dbmod.SessionLocal, job_id, token)
     handler = _handlers().get(job_type)
     try:
         if handler is None:
             raise queue.PermanentJobError(f"Unknown job type {job_type!r}")
         handler(ctx, scan_id)
         with dbmod.SessionLocal() as db:
-            queue.finish(db, job_id, "succeeded")
+            queue.finish(db, job_id, token, "succeeded")
+    except queue.StaleAttempt as exc:
+        # Another attempt owns the job now: write nothing about it, just drop this attempt's staged work.
+        log.warning("job %s: abandoning stale attempt (%s)", job_id, exc)
+        _discard_attempt(scan_id, token)
     except queue.JobCancelled as exc:
         log.info("job %s cancelled: %s", job_id, exc)
         with dbmod.SessionLocal() as db:
-            queue.finish(db, job_id, "cancelled", str(exc), retryable=False)
+            queue.finish(db, job_id, token, "cancelled", str(exc), retryable=False)
+        _discard_attempt(scan_id, token)
     except queue.PermanentJobError as exc:
         log.warning("job %s failed permanently: %s", job_id, exc)
         with dbmod.SessionLocal() as db:
-            queue.finish(db, job_id, "failed", str(exc), retryable=False)
+            queue.finish(db, job_id, token, "failed", str(exc), retryable=False)
+        _discard_attempt(scan_id, token)
     except Exception as exc:  # noqa: BLE001 - surface any pipeline error to the user
         log.error("job %s crashed: %s", job_id, traceback.format_exc())
         with dbmod.SessionLocal() as db:
-            queue.finish(db, job_id, "failed", f"{type(exc).__name__}: {exc}", retryable=True)
+            queue.finish(db, job_id, token, "failed", f"{type(exc).__name__}: {exc}", retryable=True)
+        _discard_attempt(scan_id, token)
     return True
+
+
+def _discard_attempt(scan_id: int, attempt_id: str) -> None:
+    from ..pipeline import discard_attempt
+
+    try:
+        discard_attempt(scan_id, attempt_id)
+    except Exception:  # noqa: BLE001 - cleanup must never mask the original outcome
+        log.error("cleanup of attempt %s failed: %s", attempt_id, traceback.format_exc())
 
 
 def sweep() -> None:

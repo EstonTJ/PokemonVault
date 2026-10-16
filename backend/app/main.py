@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import IntegrityError
 
 from .api import collection, scans, system
 from .auth import init_auth
@@ -37,6 +38,12 @@ app.include_router(system.router)
 app.include_router(scans.upload_router)
 app.include_router(scans.router)
 app.include_router(collection.router)
+
+
+@app.exception_handler(IntegrityError)
+async def integrity_error(request: Request, exc: IntegrityError):
+    # The database rejected a write that broke a data rule (constraint backstop). Don't leak SQL details.
+    return JSONResponse({"detail": "That change conflicts with existing data or breaks a data rule."}, status_code=409)
 
 
 @app.middleware("http")

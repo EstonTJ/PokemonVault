@@ -145,11 +145,11 @@ def test_cancel_running_job(client, tmp_path):
     assert client.post(f"/api/scans/{scan_id}/cancel", headers=H).status_code == 200
     from app.pipeline import process_scan
 
-    ctx = queue.JobContext(dbmod.SessionLocal, job.id, "w-test")
+    ctx = queue.JobContext(dbmod.SessionLocal, job.id, job.lease_token)
     with pytest.raises(queue.JobCancelled):
         process_scan(ctx, scan_id)
     with dbmod.SessionLocal() as db:
-        queue.finish(db, job.id, "cancelled", retryable=False)
+        queue.finish(db, job.id, job.lease_token, "cancelled", retryable=False)
         assert db.get(Job, job.id).status == "cancelled"
     scan = client.get(f"/api/scans/{scan_id}").json()
     assert scan["status"] == "cancelled"

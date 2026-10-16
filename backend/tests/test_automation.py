@@ -123,29 +123,60 @@ def test_auto_link_resightings_only_when_unambiguous(client, tmp_path):
     summary = s2["summary"]
 
     after = client.get("/api/pokemon").json()
-    # Nothing was duplicated: re-sightings were linked, only genuinely new confident items were added.
-    linked = [g for g in s2["groups"] if g["link_method"] == "auto-link"]
     added = [g for g in s2["groups"] if g["link_method"] == "auto"]
-    assert summary["auto_linked"] == len(linked) >= 6
+    # The storage grid only shows species + CP. That is never enough to auto-link (review finding 1):
+    # every re-sighting must wait for the owner, and none may be auto-added as a duplicate either.
+    assert summary["auto_linked"] == 0
+    assert not any(g["link_method"] == "auto-link" for g in s2["groups"])
+    resightings = [g for g in s2["groups"] if g["candidates"]]
+    assert len(resightings) >= 6 and all(g["status"] == "needs_review" for g in resightings)
     assert len(after) == n_before + len(added)
-    for g in linked:
-        assert g["pokemon_id"] in {p["id"] for p in before}
-
-    # The identical Bidoof pair: two existing matches -> never auto-linked, stays in Review.
-    bidoofs = [g for g in s2["groups"] if (g["attributes"].get("species_id") or {}).get("value") == "bidoof"]
-    assert len(bidoofs) == 2 and all(g["status"] == "needs_review" for g in bidoofs)
-    # The nickname-only Pikachu ("Sparky") and the form-ambiguous Ponyta also wait for the owner.
+    # The genuinely new, confident Snorlax (different CP) is the kind of item that is auto-added.
+    assert any(g["attributes"]["species_id"]["value"] == "snorlax" for g in added)
     for g in s2["groups"]:
         a = g["attributes"]
         if (a.get("nickname") or {}).get("value") == "Sparky" or (a.get("species_id") or {}).get("value") == "ponyta":
             assert g["status"] == "needs_review", g
-    # Snorlax at a different CP is not the same individual as the stored Snorlax.
-    assert not any(g["link_method"] == "auto-link" and g["attributes"]["species_id"]["value"] == "snorlax" for g in s2["groups"])
 
-    # Linking never downgrades a Pokémon the owner already confirmed.
-    linked_p = client.get(f"/api/pokemon/{linked[0]['pokemon_id']}").json()
-    assert linked_p["user_confirmed"] is True and linked_p["confirmed_via"] == "bulk"
-    assert any(e["kind"] == "auto-link" for e in linked_p["evidence"])
+
+def _group(db, scan, key, **vals):
+    from app.models import ObservationGroup
+
+    attrs = {k: {"value": v, "confidence": 0.99, "method": "test", "frame_id": None} for k, v in vals.items()}
+    g = ObservationGroup(scan_id=scan.id, track_key=key, attributes=attrs, status="needs_review", review_reasons=[])
+    db.add(g)
+    db.flush()
+    return g
+
+
+@pytest.mark.parametrize("seen, stored, should_link", [
+    # species + CP only, other fields missing on one or both sides: NOT enough (finding 1 repro)
+    ({}, {}, False),
+    ({"hp": 60}, {}, False),
+    ({}, {"hp": 60, "weight_kg": 1.5, "height_m": 0.3}, False),
+    # a positive corroborating match on either HP, weight+height, or verified IVs: linked
+    ({"hp": 60}, {"hp": 60}, True),
+    ({"weight_kg": 1.5, "height_m": 0.3}, {"weight_kg": 1.5, "height_m": 0.3}, True),
+    ({"ivs": [1, 2, 3]}, {"iv_atk": 1, "iv_def": 2, "iv_sta": 3, "iv_status": "verified"}, True),
+    # weight alone (height missing) isn't a full fingerprint
+    ({"weight_kg": 1.5}, {"weight_kg": 1.5, "height_m": 0.3}, False),
+])
+def test_auto_link_requires_positive_evidence(fresh_db, seen, stored, should_link):
+    from app.catalog.importer import auto_link_resightings, refresh_candidates
+    from app.models import Pokemon, Scan
+
+    with fresh_db.SessionLocal() as db:
+        scan = Scan(original_filename="t.mp4", sha256="t", size_bytes=1)
+        db.add(scan)
+        p = Pokemon(species_id="pidgey", dex=16, cp=500, user_confirmed=True, **stored)
+        db.add(p)
+        db.flush()
+        g = _group(db, scan, "k1", species_id="pidgey", dex=16, cp=500, **seen)
+        refresh_candidates(db, g)
+        assert [c["pokemon_id"] for c in g.candidate_pokemon_ids] == [p.id]
+        linked = auto_link_resightings(db, scan.id)
+        assert (linked == [p.id]) is should_link
+        assert (g.status == "confirmed") is should_link
 
 
 def test_no_auto_link_when_setting_off(client, tmp_path):
